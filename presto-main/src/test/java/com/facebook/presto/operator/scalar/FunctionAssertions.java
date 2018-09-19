@@ -59,6 +59,7 @@ import com.facebook.presto.sql.gen.ExpressionCompiler;
 import com.facebook.presto.sql.parser.SqlParser;
 import com.facebook.presto.sql.planner.Symbol;
 import com.facebook.presto.sql.planner.SymbolToInputRewriter;
+import com.facebook.presto.sql.planner.TypeProvider;
 import com.facebook.presto.sql.planner.plan.PlanNodeId;
 import com.facebook.presto.sql.relational.RowExpression;
 import com.facebook.presto.sql.tree.Cast;
@@ -191,7 +192,7 @@ public final class FunctionAssertions
             .put(new Symbol("bound_integer"), 9)
             .build();
 
-    private static final Map<Symbol, Type> SYMBOL_TYPES = ImmutableMap.<Symbol, Type>builder()
+    private static final TypeProvider SYMBOL_TYPES = TypeProvider.copyOf(ImmutableMap.<Symbol, Type>builder()
             .put(new Symbol("bound_long"), BIGINT)
             .put(new Symbol("bound_string"), VARCHAR)
             .put(new Symbol("bound_double"), DOUBLE)
@@ -202,7 +203,7 @@ public final class FunctionAssertions
             .put(new Symbol("bound_timestamp_with_timezone"), TIMESTAMP_WITH_TIME_ZONE)
             .put(new Symbol("bound_binary_literal"), VARBINARY)
             .put(new Symbol("bound_integer"), INTEGER)
-            .build();
+            .build());
 
     private static final PageSourceProvider PAGE_SOURCE_PROVIDER = new TestPageSourceProvider();
     private static final PlanNodeId SOURCE_ID = new PlanNodeId("scan");
@@ -331,7 +332,7 @@ public final class FunctionAssertions
         catch (PrestoException e) {
             try {
                 assertEquals(e.getErrorCode(), errorCode.toErrorCode());
-                assertTrue(e.getMessage().equals(messagePattern) || e.getMessage().matches(messagePattern));
+                assertTrue(e.getMessage().equals(messagePattern) || e.getMessage().matches(messagePattern), format("Error message [%s] doesn't match [%s]", e.getMessage(), messagePattern));
             }
             catch (Throwable failure) {
                 failure.addSuppressed(e);
@@ -461,7 +462,7 @@ public final class FunctionAssertions
         requireNonNull(projection, "projection is null");
 
         Expression projectionExpression = createExpression(session, projection, metadata, SYMBOL_TYPES);
-        RowExpression projectionRowExpression = toRowExpression(projectionExpression);
+        RowExpression projectionRowExpression = toRowExpression(session, projectionExpression);
         PageProcessor processor = compiler.compilePageProcessor(Optional.empty(), ImmutableList.of(projectionRowExpression)).get();
 
         // This is a heuristic to detect whether the retained size of cachedInstance is bounded.
@@ -572,11 +573,10 @@ public final class FunctionAssertions
         requireNonNull(projection, "projection is null");
 
         Expression projectionExpression = createExpression(session, projection, metadata, SYMBOL_TYPES);
-        RowExpression projectionRowExpression = toRowExpression(projectionExpression);
+        RowExpression projectionRowExpression = toRowExpression(session, projectionExpression);
 
         List<Object> results = new ArrayList<>();
 
-        //
         // If the projection does not need bound values, execute query using full engine
         if (!needsBoundValue(projectionExpression)) {
             MaterializedResult result = runner.execute("SELECT " + projection);
@@ -589,24 +589,21 @@ public final class FunctionAssertions
 
         // execute as standalone operator
         OperatorFactory operatorFactory = compileFilterProject(Optional.empty(), projectionRowExpression, compiler);
-        assertType(operatorFactory.getTypes(), expectedType);
-        Object directOperatorValue = selectSingleValue(operatorFactory, session);
+        Object directOperatorValue = selectSingleValue(operatorFactory, expectedType, session);
         results.add(directOperatorValue);
 
         // interpret
-        Operator interpretedFilterProject = interpretedFilterProject(Optional.empty(), projectionExpression, session);
-        assertType(interpretedFilterProject.getTypes(), expectedType);
-        Object interpretedValue = selectSingleValue(interpretedFilterProject);
+        Operator interpretedFilterProject = interpretedFilterProject(Optional.empty(), projectionExpression, expectedType, session);
+        Object interpretedValue = selectSingleValue(interpretedFilterProject, expectedType);
         results.add(interpretedValue);
 
         // execute over normal operator
         SourceOperatorFactory scanProjectOperatorFactory = compileScanFilterProject(Optional.empty(), projectionRowExpression, compiler);
-        assertType(scanProjectOperatorFactory.getTypes(), expectedType);
-        Object scanOperatorValue = selectSingleValue(scanProjectOperatorFactory, createNormalSplit(), session);
+        Object scanOperatorValue = selectSingleValue(scanProjectOperatorFactory, expectedType, createNormalSplit(), session);
         results.add(scanOperatorValue);
 
         // execute over record set
-        Object recordValue = selectSingleValue(scanProjectOperatorFactory, createRecordSetSplit(), session);
+        Object recordValue = selectSingleValue(scanProjectOperatorFactory, expectedType, createRecordSetSplit(), session);
         results.add(recordValue);
 
         //
@@ -620,14 +617,16 @@ public final class FunctionAssertions
             results.add(queryResult);
         }
 
+        // validate type at end since some tests expect failure and for those UNKNOWN is used instead of actual type
+        assertEquals(projectionRowExpression.getType(), expectedType);
         return results;
     }
 
-    private RowExpression toRowExpression(Expression projectionExpression)
+    private RowExpression toRowExpression(Session session, Expression projectionExpression)
     {
         Expression translatedProjection = new SymbolToInputRewriter(INPUT_MAPPING).rewrite(projectionExpression);
         Map<NodeRef<Expression>, Type> expressionTypes = getExpressionTypesFromInput(
-                TEST_SESSION,
+                session,
                 metadata,
                 SQL_PARSER,
                 INPUT_TYPES,
@@ -636,28 +635,27 @@ public final class FunctionAssertions
         return toRowExpression(translatedProjection, expressionTypes);
     }
 
-    private Object selectSingleValue(OperatorFactory operatorFactory, Session session)
+    private Object selectSingleValue(OperatorFactory operatorFactory, Type type, Session session)
     {
         Operator operator = operatorFactory.createOperator(createDriverContext(session));
-        return selectSingleValue(operator);
+        return selectSingleValue(operator, type);
     }
 
-    private Object selectSingleValue(SourceOperatorFactory operatorFactory, Split split, Session session)
+    private Object selectSingleValue(SourceOperatorFactory operatorFactory, Type type, Split split, Session session)
     {
         SourceOperator operator = operatorFactory.createOperator(createDriverContext(session));
         operator.addSplit(split);
         operator.noMoreSplits();
-        return selectSingleValue(operator);
+        return selectSingleValue(operator, type);
     }
 
-    private Object selectSingleValue(Operator operator)
+    private Object selectSingleValue(Operator operator, Type type)
     {
         Page output = getAtMostOnePage(operator, SOURCE_PAGE);
 
         assertNotNull(output);
         assertEquals(output.getPositionCount(), 1);
         assertEquals(output.getChannelCount(), 1);
-        Type type = operator.getTypes().get(0);
 
         Block block = output.getBlock(0);
         assertEquals(block.getPositionCount(), 1);
@@ -686,7 +684,7 @@ public final class FunctionAssertions
         requireNonNull(filter, "filter is null");
 
         Expression filterExpression = createExpression(session, filter, metadata, SYMBOL_TYPES);
-        RowExpression filterRowExpression = toRowExpression(filterExpression);
+        RowExpression filterRowExpression = toRowExpression(session, filterExpression);
 
         List<Boolean> results = new ArrayList<>();
 
@@ -701,7 +699,7 @@ public final class FunctionAssertions
         }
 
         // interpret
-        boolean interpretedValue = executeFilter(interpretedFilterProject(Optional.of(filterExpression), TRUE_LITERAL, session));
+        boolean interpretedValue = executeFilter(interpretedFilterProject(Optional.of(filterExpression), TRUE_LITERAL, BOOLEAN, session));
         results.add(interpretedValue);
 
         // execute over normal operator
@@ -733,12 +731,12 @@ public final class FunctionAssertions
         return results;
     }
 
-    public static Expression createExpression(String expression, Metadata metadata, Map<Symbol, Type> symbolTypes)
+    public static Expression createExpression(String expression, Metadata metadata, TypeProvider symbolTypes)
     {
         return createExpression(TEST_SESSION, expression, metadata, symbolTypes);
     }
 
-    public static Expression createExpression(Session session, String expression, Metadata metadata, Map<Symbol, Type> symbolTypes)
+    public static Expression createExpression(Session session, String expression, Metadata metadata, TypeProvider symbolTypes)
     {
         Expression parsedExpression = SQL_PARSER.createExpression(expression, createParsingOptions(session));
 
@@ -822,7 +820,7 @@ public final class FunctionAssertions
             assertEquals(page.getPositionCount(), 1);
             assertEquals(page.getChannelCount(), 1);
 
-            assertTrue(operator.getTypes().get(0).getBoolean(page.getBlock(0), 0));
+            assertTrue(BOOLEAN.getBoolean(page.getBlock(0), 0));
             value = true;
         }
         else {
@@ -863,7 +861,7 @@ public final class FunctionAssertions
         return hasSymbolReferences.get();
     }
 
-    private Operator interpretedFilterProject(Optional<Expression> filter, Expression projection, Session session)
+    private Operator interpretedFilterProject(Optional<Expression> filter, Expression projection, Type expectedType, Session session)
     {
         Optional<PageFilter> pageFilter = filter
                 .map(expression -> new InterpretedPageFilter(
@@ -875,6 +873,7 @@ public final class FunctionAssertions
                         session));
 
         PageProjection pageProjection = new InterpretedPageProjection(projection, SYMBOL_TYPES, INPUT_MAPPING, metadata, SQL_PARSER, session);
+        assertEquals(pageProjection.getType(), expectedType);
 
         PageProcessor processor = new PageProcessor(pageFilter, ImmutableList.of(pageProjection));
         OperatorFactory operatorFactory = new FilterAndProjectOperatorFactory(
@@ -993,6 +992,11 @@ public final class FunctionAssertions
         assertTrue(types.size() == 1, "Expected one type, but got " + types);
         Type actualType = types.get(0);
         assertEquals(actualType, expectedType);
+    }
+
+    public Session getSession()
+    {
+        return session;
     }
 
     @Override

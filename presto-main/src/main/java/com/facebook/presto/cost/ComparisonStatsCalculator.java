@@ -14,12 +14,11 @@
 package com.facebook.presto.cost;
 
 import com.facebook.presto.sql.planner.Symbol;
-import com.facebook.presto.sql.tree.ComparisonExpressionType;
+import com.facebook.presto.sql.tree.ComparisonExpression;
 
 import java.util.Optional;
 import java.util.OptionalDouble;
 
-import static com.facebook.presto.cost.FilterStatsCalculator.filterStatsForUnknownExpression;
 import static com.facebook.presto.cost.SymbolStatsEstimate.buildFrom;
 import static com.facebook.presto.util.MoreMath.firstNonNaN;
 import static com.facebook.presto.util.MoreMath.max;
@@ -34,14 +33,14 @@ public final class ComparisonStatsCalculator
 {
     private ComparisonStatsCalculator() {}
 
-    public static PlanNodeStatsEstimate comparisonExpressionToLiteralStats(
+    public static Optional<PlanNodeStatsEstimate> comparisonExpressionToLiteralStats(
             PlanNodeStatsEstimate inputStatistics,
             Optional<Symbol> symbol,
             SymbolStatsEstimate expressionStats,
             OptionalDouble doubleLiteral,
-            ComparisonExpressionType type)
+            ComparisonExpression.Operator operator)
     {
-        switch (type) {
+        switch (operator) {
             case EQUAL:
                 return expressionToLiteralEquality(inputStatistics, symbol, expressionStats, doubleLiteral);
             case NOT_EQUAL:
@@ -54,11 +53,11 @@ public final class ComparisonStatsCalculator
                 return expressionToLiteralGreaterThan(inputStatistics, symbol, expressionStats, doubleLiteral);
             case IS_DISTINCT_FROM:
             default:
-                return filterStatsForUnknownExpression(inputStatistics);
+                return Optional.empty();
         }
     }
 
-    private static PlanNodeStatsEstimate expressionToLiteralRangeComparison(
+    private static Optional<PlanNodeStatsEstimate> expressionToLiteralRangeComparison(
             PlanNodeStatsEstimate inputStatistics,
             Optional<Symbol> symbol,
             SymbolStatsEstimate expressionStats,
@@ -79,10 +78,10 @@ public final class ComparisonStatsCalculator
                             .build();
             estimate = estimate.mapSymbolColumnStatistics(symbol.get(), oldStats -> symbolNewEstimate);
         }
-        return estimate;
+        return Optional.of(estimate);
     }
 
-    private static PlanNodeStatsEstimate expressionToLiteralEquality(
+    private static Optional<PlanNodeStatsEstimate> expressionToLiteralEquality(
             PlanNodeStatsEstimate inputStatistics,
             Optional<Symbol> symbol,
             SymbolStatsEstimate expressionStats,
@@ -98,7 +97,7 @@ public final class ComparisonStatsCalculator
         return expressionToLiteralRangeComparison(inputStatistics, symbol, expressionStats, literalRange);
     }
 
-    private static PlanNodeStatsEstimate expressionToLiteralNonEquality(
+    private static Optional<PlanNodeStatsEstimate> expressionToLiteralNonEquality(
             PlanNodeStatsEstimate inputStatistics,
             Optional<Symbol> symbol,
             SymbolStatsEstimate expressionStats,
@@ -125,10 +124,10 @@ public final class ComparisonStatsCalculator
                     .build();
             estimate = estimate.addSymbolStatistics(symbol.get(), symbolNewEstimate);
         }
-        return estimate.build();
+        return Optional.of(estimate.build());
     }
 
-    private static PlanNodeStatsEstimate expressionToLiteralLessThan(
+    private static Optional<PlanNodeStatsEstimate> expressionToLiteralLessThan(
             PlanNodeStatsEstimate inputStatistics,
             Optional<Symbol> symbol,
             SymbolStatsEstimate expressionStats,
@@ -137,7 +136,7 @@ public final class ComparisonStatsCalculator
         return expressionToLiteralRangeComparison(inputStatistics, symbol, expressionStats, new StatisticRange(NEGATIVE_INFINITY, literal.orElse(POSITIVE_INFINITY), NaN));
     }
 
-    private static PlanNodeStatsEstimate expressionToLiteralGreaterThan(
+    private static Optional<PlanNodeStatsEstimate> expressionToLiteralGreaterThan(
             PlanNodeStatsEstimate inputStatistics,
             Optional<Symbol> symbol,
             SymbolStatsEstimate expressionStats,
@@ -146,15 +145,15 @@ public final class ComparisonStatsCalculator
         return expressionToLiteralRangeComparison(inputStatistics, symbol, expressionStats, new StatisticRange(literal.orElse(NEGATIVE_INFINITY), POSITIVE_INFINITY, NaN));
     }
 
-    public static PlanNodeStatsEstimate comparisonExpressionToExpressionStats(
+    public static Optional<PlanNodeStatsEstimate> comparisonExpressionToExpressionStats(
             PlanNodeStatsEstimate inputStatistics,
             Optional<Symbol> left,
             SymbolStatsEstimate leftStats,
             Optional<Symbol> right,
             SymbolStatsEstimate rightStats,
-            ComparisonExpressionType type)
+            ComparisonExpression.Operator operator)
     {
-        switch (type) {
+        switch (operator) {
             case EQUAL:
                 return expressionToExpressionEquality(inputStatistics, left, leftStats, right, rightStats);
             case NOT_EQUAL:
@@ -165,11 +164,11 @@ public final class ComparisonStatsCalculator
             case GREATER_THAN_OR_EQUAL:
             case IS_DISTINCT_FROM:
             default:
-                return filterStatsForUnknownExpression(inputStatistics);
+                return Optional.empty();
         }
     }
 
-    private static PlanNodeStatsEstimate expressionToExpressionEquality(
+    private static Optional<PlanNodeStatsEstimate> expressionToExpressionEquality(
             PlanNodeStatsEstimate inputStatistics,
             Optional<Symbol> left,
             SymbolStatsEstimate leftStats,
@@ -177,7 +176,7 @@ public final class ComparisonStatsCalculator
             SymbolStatsEstimate rightStats)
     {
         if (isNaN(leftStats.getDistinctValuesCount()) || isNaN(rightStats.getDistinctValuesCount())) {
-            filterStatsForUnknownExpression(inputStatistics);
+            return Optional.empty();
         }
 
         StatisticRange leftRange = StatisticRange.from(leftStats);
@@ -186,12 +185,10 @@ public final class ComparisonStatsCalculator
         StatisticRange intersect = leftRange.intersect(rightRange);
 
         double nullsFilterFactor = (1 - leftStats.getNullsFraction()) * (1 - rightStats.getNullsFraction());
-        double leftFilterFactor = firstNonNaN(leftRange.overlapPercentWith(intersect), 1);
-        double rightFilterFactor = firstNonNaN(rightRange.overlapPercentWith(intersect), 1);
-        double leftNdvInRange = leftFilterFactor * leftRange.getDistinctValuesCount();
-        double rightNdvInRange = rightFilterFactor * rightRange.getDistinctValuesCount();
-        double filterFactor = 1 * leftFilterFactor * rightFilterFactor / max(leftNdvInRange, rightNdvInRange, 1);
-        double retainedNdv = min(leftNdvInRange, rightNdvInRange);
+        double leftNdv = leftRange.getDistinctValuesCount();
+        double rightNdv = rightRange.getDistinctValuesCount();
+        double filterFactor = 1.0 / max(leftNdv, rightNdv, 1);
+        double retainedNdv = min(leftNdv, rightNdv);
 
         PlanNodeStatsEstimate.Builder estimate = PlanNodeStatsEstimate.buildFrom(inputStatistics)
                 .setOutputRowCount(inputStatistics.getOutputRowCount() * nullsFilterFactor * filterFactor);
@@ -206,7 +203,7 @@ public final class ComparisonStatsCalculator
         left.ifPresent(symbol -> estimate.addSymbolStatistics(symbol, equalityStats));
         right.ifPresent(symbol -> estimate.addSymbolStatistics(symbol, equalityStats));
 
-        return estimate.build();
+        return Optional.of(estimate.build());
     }
 
     private static double averageExcludingNaNs(double first, double second)
@@ -220,7 +217,7 @@ public final class ComparisonStatsCalculator
         return firstNonNaN(first, second);
     }
 
-    private static PlanNodeStatsEstimate expressionToExpressionNonEquality(
+    private static Optional<PlanNodeStatsEstimate> expressionToExpressionNonEquality(
             PlanNodeStatsEstimate inputStatistics,
             Optional<Symbol> left,
             SymbolStatsEstimate leftStats,
@@ -231,8 +228,12 @@ public final class ComparisonStatsCalculator
         PlanNodeStatsEstimate inputNullsFiltered = inputStatistics.mapOutputRowCount(size -> size * nullsFilterFactor);
         SymbolStatsEstimate leftNullsFiltered = leftStats.mapNullsFraction(nullsFraction -> 0.0);
         SymbolStatsEstimate rightNullsFiltered = rightStats.mapNullsFraction(nullsFration -> 0.0);
+        Optional<PlanNodeStatsEstimate> equalityStats = expressionToExpressionEquality(inputNullsFiltered, left, leftNullsFiltered, right, rightNullsFiltered);
+        if (!equalityStats.isPresent()) {
+            return Optional.empty();
+        }
         PlanNodeStatsEstimate resultStats = inputNullsFiltered.mapOutputRowCount(rowCount -> {
-            double equalityFilterFactor = expressionToExpressionEquality(inputNullsFiltered, left, leftNullsFiltered, right, rightNullsFiltered).getOutputRowCount() / inputNullsFiltered.getOutputRowCount();
+            double equalityFilterFactor = equalityStats.get().getOutputRowCount() / inputNullsFiltered.getOutputRowCount();
             if (!isFinite(equalityFilterFactor)) {
                 equalityFilterFactor = 0.0;
             }
@@ -245,6 +246,6 @@ public final class ComparisonStatsCalculator
             resultStats = resultStats.mapSymbolColumnStatistics(right.get(), stats -> rightNullsFiltered);
         }
 
-        return resultStats;
+        return Optional.of(resultStats);
     }
 }

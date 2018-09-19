@@ -17,7 +17,6 @@ import com.facebook.presto.Session;
 import com.facebook.presto.execution.StateMachine.StateChangeListener;
 import com.facebook.presto.memory.VersionedMemoryPoolId;
 import com.facebook.presto.spi.QueryId;
-import com.facebook.presto.spi.resourceGroups.QueryType;
 import com.facebook.presto.spi.resourceGroups.ResourceGroupId;
 import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.sql.planner.Plan;
@@ -26,7 +25,6 @@ import com.facebook.presto.sql.tree.Statement;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.util.concurrent.ListenableFuture;
-import io.airlift.units.Duration;
 
 import java.net.URI;
 import java.util.List;
@@ -37,10 +35,9 @@ import java.util.function.Consumer;
 import static java.util.Objects.requireNonNull;
 
 public interface QueryExecution
+        extends ManagedQueryExecution
 {
     QueryId getQueryId();
-
-    QueryInfo getQueryInfo();
 
     QueryState getState();
 
@@ -50,23 +47,13 @@ public interface QueryExecution
 
     Optional<ResourceGroupId> getResourceGroup();
 
-    void setResourceGroup(ResourceGroupId resourceGroupId);
-
     Plan getQueryPlan();
+
+    QueryInfo getQueryInfo();
 
     VersionedMemoryPoolId getMemoryPool();
 
     void setMemoryPool(VersionedMemoryPoolId poolId);
-
-    long getUserMemoryReservation();
-
-    Duration getTotalCpuTime();
-
-    Session getSession();
-
-    void start();
-
-    void fail(Throwable cause);
 
     void cancelQuery();
 
@@ -85,8 +72,6 @@ public interface QueryExecution
     {
         T createQueryExecution(QueryId queryId, String query, Session session, Statement statement, List<Expression> parameters);
     }
-
-    Optional<QueryType> getQueryType();
 
     /**
      * Output schema and buffer URIs for query.  The info will always contain column names and types.  Buffer locations will always

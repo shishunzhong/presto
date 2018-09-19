@@ -17,9 +17,9 @@ import com.facebook.presto.OutputBuffers;
 import com.facebook.presto.OutputBuffers.OutputBufferId;
 import com.facebook.presto.Session;
 import com.facebook.presto.connector.ConnectorId;
+import com.facebook.presto.execution.BasicStageStats;
 import com.facebook.presto.execution.LocationFactory;
 import com.facebook.presto.execution.NodeTaskMap;
-import com.facebook.presto.execution.QueryExecution.QueryOutputInfo;
 import com.facebook.presto.execution.QueryState;
 import com.facebook.presto.execution.QueryStateMachine;
 import com.facebook.presto.execution.RemoteTask;
@@ -40,13 +40,11 @@ import com.facebook.presto.sql.planner.PartitioningHandle;
 import com.facebook.presto.sql.planner.StageExecutionPlan;
 import com.facebook.presto.sql.planner.plan.PlanFragmentId;
 import com.facebook.presto.sql.planner.plan.PlanNodeId;
-import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.primitives.Ints;
-import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.SettableFuture;
 import io.airlift.concurrent.SetThreadName;
@@ -75,14 +73,14 @@ import java.util.function.Supplier;
 import static com.facebook.presto.SystemSessionProperties.getConcurrentLifespansPerNode;
 import static com.facebook.presto.SystemSessionProperties.getWriterMinSize;
 import static com.facebook.presto.connector.ConnectorId.isInternalSystemConnector;
+import static com.facebook.presto.execution.BasicStageStats.aggregateBasicStageStats;
 import static com.facebook.presto.execution.StageState.ABORTED;
 import static com.facebook.presto.execution.StageState.CANCELED;
 import static com.facebook.presto.execution.StageState.FAILED;
 import static com.facebook.presto.execution.StageState.FINISHED;
 import static com.facebook.presto.execution.StageState.RUNNING;
 import static com.facebook.presto.execution.StageState.SCHEDULED;
-import static com.facebook.presto.execution.scheduler.SourcePartitionedScheduler.simpleSourcePartitionedScheduler;
-import static com.facebook.presto.operator.PipelineExecutionStrategy.UNGROUPED_EXECUTION;
+import static com.facebook.presto.execution.scheduler.SourcePartitionedScheduler.newSourcePartitionedSchedulerAsStageScheduler;
 import static com.facebook.presto.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
 import static com.facebook.presto.spi.StandardErrorCode.NO_NODES_AVAILABLE;
 import static com.facebook.presto.spi.connector.NotPartitionedPartitionHandle.NOT_PARTITIONED;
@@ -115,14 +113,12 @@ public class SqlQueryScheduler
     private final ExecutionPolicy executionPolicy;
     private final Map<StageId, SqlStageExecution> stages;
     private final ExecutorService executor;
-    private final FailureDetector failureDetector;
     private final StageId rootStageId;
     private final Map<StageId, StageScheduler> stageSchedulers;
     private final Map<StageId, StageLinkage> stageLinkages;
     private final SplitSchedulerStats schedulerStats;
     private final boolean summarizeTaskInfo;
     private final AtomicBoolean started = new AtomicBoolean();
-    private final SettableFuture<QueryOutputInfo> rootStageOutputBufferLocations = SettableFuture.create();
 
     public SqlQueryScheduler(QueryStateMachine queryStateMachine,
             LocationFactory locationFactory,
@@ -183,7 +179,6 @@ public class SqlQueryScheduler
         this.stageLinkages = stageLinkages.build();
 
         this.executor = queryExecutor;
-        this.failureDetector = failureDetector;
 
         rootStage.addStateChangeListener(state -> {
             if (state == FINISHED) {
@@ -214,6 +209,16 @@ public class SqlQueryScheduler
                     }
                 }
             });
+        }
+
+        // when query is done or any time a stage completes, attempt to transition query to "final query info ready"
+        queryStateMachine.addStateChangeListener(newState -> {
+            if (newState.isDone()) {
+                queryStateMachine.updateQueryInfo(Optional.ofNullable(getStageInfo()));
+            }
+        });
+        for (SqlStageExecution stage : stages) {
+            stage.addFinalStatusListener(status -> queryStateMachine.updateQueryInfo(Optional.ofNullable(getStageInfo())));
         }
     }
 
@@ -275,8 +280,8 @@ public class SqlQueryScheduler
             NodeSelector nodeSelector = nodeScheduler.createNodeSelector(connectorId);
             SplitPlacementPolicy placementPolicy = new DynamicSplitPlacementPolicy(nodeSelector, stage::getAllTasks);
 
-            checkArgument(plan.getFragment().getPipelineExecutionStrategy() == UNGROUPED_EXECUTION);
-            stageSchedulers.put(stageId, simpleSourcePartitionedScheduler(stage, planNodeId, splitSource, placementPolicy, splitBatchSize));
+            checkArgument(!plan.getFragment().getStageExecutionStrategy().isAnyScanGroupedExecution());
+            stageSchedulers.put(stageId, newSourcePartitionedSchedulerAsStageScheduler(stage, planNodeId, splitSource, placementPolicy, splitBatchSize));
             bucketToPartition = Optional.of(new int[1]);
         }
         else if (partitioningHandle.equals(SCALED_WRITER_DISTRIBUTION)) {
@@ -292,21 +297,18 @@ public class SqlQueryScheduler
             if (!splitSources.isEmpty()) {
                 List<PlanNodeId> schedulingOrder = plan.getFragment().getPartitionedSources();
                 List<ConnectorPartitionHandle> connectorPartitionHandles;
-                switch (plan.getFragment().getPipelineExecutionStrategy()) {
-                    case GROUPED_EXECUTION:
-                        connectorPartitionHandles = nodePartitioningManager.listPartitionHandles(session, partitioningHandle);
-                        checkState(!ImmutableList.of(NOT_PARTITIONED).equals(connectorPartitionHandles));
-                        break;
-                    case UNGROUPED_EXECUTION:
-                        connectorPartitionHandles = ImmutableList.of(NOT_PARTITIONED);
-                        break;
-                    default:
-                        throw new UnsupportedOperationException();
+                if (plan.getFragment().getStageExecutionStrategy().isAnyScanGroupedExecution()) {
+                    connectorPartitionHandles = nodePartitioningManager.listPartitionHandles(session, partitioningHandle);
+                    checkState(connectorPartitionHandles.size() == nodePartitionMap.getBucketToPartition().length);
+                    checkState(!ImmutableList.of(NOT_PARTITIONED).equals(connectorPartitionHandles));
+                }
+                else {
+                    connectorPartitionHandles = ImmutableList.of(NOT_PARTITIONED);
                 }
                 stageSchedulers.put(stageId, new FixedSourcePartitionedScheduler(
                         stage,
                         splitSources,
-                        plan.getFragment().getPipelineExecutionStrategy(),
+                        plan.getFragment().getStageExecutionStrategy(),
                         schedulingOrder,
                         nodePartitionMap,
                         splitBatchSize,
@@ -383,9 +385,13 @@ public class SqlQueryScheduler
         return stages.build();
     }
 
-    public ListenableFuture<QueryOutputInfo> getRootStageOutputBufferLocations()
+    public BasicStageStats getBasicStageStats()
     {
-        return Futures.nonCancellationPropagating(rootStageOutputBufferLocations);
+        List<BasicStageStats> stageStats = stages.values().stream()
+                .map(SqlStageExecution::getBasicStageStats)
+                .collect(toImmutableList());
+
+        return aggregateBasicStageStats(stageStats);
     }
 
     public StageInfo getStageInfo()
@@ -423,6 +429,13 @@ public class SqlQueryScheduler
     {
         return stages.values().stream()
                 .mapToLong(SqlStageExecution::getUserMemoryReservation)
+                .sum();
+    }
+
+    public long getTotalMemoryReservation()
+    {
+        return stages.values().stream()
+                .mapToLong(SqlStageExecution::getTotalMemoryReservation)
                 .sum();
     }
 
@@ -514,7 +527,7 @@ public class SqlQueryScheduler
         }
         catch (Throwable t) {
             queryStateMachine.transitionToFailed(t);
-            throw Throwables.propagate(t);
+            throw t;
         }
         finally {
             RuntimeException closeError = new RuntimeException();
@@ -548,8 +561,7 @@ public class SqlQueryScheduler
     public void abort()
     {
         try (SetThreadName ignored = new SetThreadName("Query-%s", queryStateMachine.getQueryId())) {
-            stages.values().stream()
-                    .forEach(SqlStageExecution::abort);
+            stages.values().forEach(SqlStageExecution::abort);
         }
     }
 

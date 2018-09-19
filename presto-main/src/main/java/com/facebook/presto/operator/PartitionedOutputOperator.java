@@ -28,12 +28,9 @@ import com.facebook.presto.sql.planner.plan.PlanNodeId;
 import com.facebook.presto.util.Mergeable;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
-import com.google.common.collect.ImmutableList;
-import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import io.airlift.units.DataSize;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.OptionalInt;
@@ -43,7 +40,6 @@ import java.util.function.Function;
 import static com.facebook.presto.execution.buffer.PageSplitterUtil.splitPage;
 import static com.facebook.presto.spi.block.PageBuilderStatus.DEFAULT_MAX_PAGE_SIZE_IN_BYTES;
 import static com.google.common.base.MoreObjects.toStringHelper;
-import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static java.lang.Math.max;
 import static java.lang.Math.min;
@@ -150,12 +146,6 @@ public class PartitionedOutputOperator
         }
 
         @Override
-        public List<Type> getTypes()
-        {
-            return ImmutableList.of();
-        }
-
-        @Override
         public Operator createOperator(DriverContext driverContext)
         {
             OperatorContext operatorContext = driverContext.addOperatorContext(operatorId, planNodeId, PartitionedOutputOperator.class.getSimpleName());
@@ -200,9 +190,9 @@ public class PartitionedOutputOperator
     private final OperatorContext operatorContext;
     private final Function<Page, Page> pagePreprocessor;
     private final PagePartitioner partitionFunction;
+    private final OutputBuffer outputBuffer;
     private final LocalMemoryContext systemMemoryContext;
     private final long partitionsInitialRetainedSize;
-    private ListenableFuture<?> blocked = NOT_BLOCKED;
     private boolean finished;
 
     public PartitionedOutputOperator(
@@ -220,6 +210,7 @@ public class PartitionedOutputOperator
     {
         this.operatorContext = requireNonNull(operatorContext, "operatorContext is null");
         this.pagePreprocessor = requireNonNull(pagePreprocessor, "pagePreprocessor is null");
+        this.outputBuffer = requireNonNull(outputBuffer, "outputBuffer is null");
         this.partitionFunction = new PagePartitioner(
                 partitionFunction,
                 partitionChannels,
@@ -232,7 +223,7 @@ public class PartitionedOutputOperator
                 maxMemory);
 
         operatorContext.setInfoSupplier(this::getInfo);
-        this.systemMemoryContext = operatorContext.newLocalSystemMemoryContext();
+        this.systemMemoryContext = operatorContext.newLocalSystemMemoryContext(PartitionedOutputOperator.class.getSimpleName());
         this.partitionsInitialRetainedSize = this.partitionFunction.getRetainedSizeInBytes();
         this.systemMemoryContext.setBytes(partitionsInitialRetainedSize);
     }
@@ -249,16 +240,10 @@ public class PartitionedOutputOperator
     }
 
     @Override
-    public List<Type> getTypes()
-    {
-        return ImmutableList.of();
-    }
-
-    @Override
     public void finish()
     {
         finished = true;
-        blocked = partitionFunction.flush(true);
+        partitionFunction.flush(true);
     }
 
     @Override
@@ -270,10 +255,8 @@ public class PartitionedOutputOperator
     @Override
     public ListenableFuture<?> isBlocked()
     {
-        if (blocked != NOT_BLOCKED && blocked.isDone()) {
-            blocked = NOT_BLOCKED;
-        }
-        return blocked;
+        ListenableFuture<?> blocked = partitionFunction.isFull();
+        return blocked.isDone() ? NOT_BLOCKED : blocked;
     }
 
     @Override
@@ -286,14 +269,13 @@ public class PartitionedOutputOperator
     public void addInput(Page page)
     {
         requireNonNull(page, "page is null");
-        checkState(isBlocked().isDone(), "output is already blocked");
 
         if (page.getPositionCount() == 0) {
             return;
         }
 
         page = pagePreprocessor.apply(page);
-        blocked = partitionFunction.partitionPage(page);
+        partitionFunction.partitionPage(page);
 
         operatorContext.recordGeneratedOutput(page.getSizeInBytes(), page.getPositionCount());
 
@@ -359,6 +341,11 @@ public class PartitionedOutputOperator
             }
         }
 
+        public ListenableFuture<?> isFull()
+        {
+            return outputBuffer.isFull();
+        }
+
         public long getSizeInBytes()
         {
             // We use a foreach loop instead of streams
@@ -384,10 +371,10 @@ public class PartitionedOutputOperator
 
         public PartitionedOutputInfo getInfo()
         {
-            return new PartitionedOutputInfo(rowsAdded.get(), pagesAdded.get());
+            return new PartitionedOutputInfo(rowsAdded.get(), pagesAdded.get(), outputBuffer.getPeakMemoryUsage());
         }
 
-        public ListenableFuture<?> partitionPage(Page page)
+        public void partitionPage(Page page)
         {
             requireNonNull(page, "page is null");
 
@@ -406,7 +393,7 @@ public class PartitionedOutputOperator
                     appendRow(pageBuilders[partition], page, position);
                 }
             }
-            return flush(false);
+            flush(false);
         }
 
         private Page getPartitionFunctionArguments(Page page)
@@ -434,10 +421,9 @@ public class PartitionedOutputOperator
             }
         }
 
-        public ListenableFuture<?> flush(boolean force)
+        public void flush(boolean force)
         {
             // add all full pages to output buffer
-            List<ListenableFuture<?>> blockedFutures = new ArrayList<>();
             for (int partition = 0; partition < pageBuilders.length; partition++) {
                 PageBuilder partitionPageBuilder = pageBuilders[partition];
                 if (!partitionPageBuilder.isEmpty() && (force || partitionPageBuilder.isFull())) {
@@ -448,16 +434,11 @@ public class PartitionedOutputOperator
                             .map(serde::serialize)
                             .collect(toImmutableList());
 
-                    blockedFutures.add(outputBuffer.enqueue(partition, serializedPages));
+                    outputBuffer.enqueue(partition, serializedPages);
                     pagesAdded.incrementAndGet();
                     rowsAdded.addAndGet(pagePartition.getPositionCount());
                 }
             }
-            ListenableFuture<?> future = Futures.allAsList(blockedFutures);
-            if (future.isDone()) {
-                return NOT_BLOCKED;
-            }
-            return future;
         }
     }
 
@@ -466,14 +447,17 @@ public class PartitionedOutputOperator
     {
         private final long rowsAdded;
         private final long pagesAdded;
+        private final long outputBufferPeakMemoryUsage;
 
         @JsonCreator
         public PartitionedOutputInfo(
                 @JsonProperty("rowsAdded") long rowsAdded,
-                @JsonProperty("pagesAdded") long pagesAdded)
+                @JsonProperty("pagesAdded") long pagesAdded,
+                @JsonProperty("outputBufferPeakMemoryUsage") long outputBufferPeakMemoryUsage)
         {
             this.rowsAdded = rowsAdded;
             this.pagesAdded = pagesAdded;
+            this.outputBufferPeakMemoryUsage = outputBufferPeakMemoryUsage;
         }
 
         @JsonProperty
@@ -488,10 +472,25 @@ public class PartitionedOutputOperator
             return pagesAdded;
         }
 
+        @JsonProperty
+        public long getOutputBufferPeakMemoryUsage()
+        {
+            return outputBufferPeakMemoryUsage;
+        }
+
         @Override
         public PartitionedOutputInfo mergeWith(PartitionedOutputInfo other)
         {
-            return new PartitionedOutputInfo(rowsAdded + other.rowsAdded, pagesAdded + other.pagesAdded);
+            return new PartitionedOutputInfo(
+                    rowsAdded + other.rowsAdded,
+                    pagesAdded + other.pagesAdded,
+                    Math.max(outputBufferPeakMemoryUsage, other.outputBufferPeakMemoryUsage));
+        }
+
+        @Override
+        public boolean isFinal()
+        {
+            return true;
         }
 
         @Override
@@ -500,6 +499,7 @@ public class PartitionedOutputOperator
             return toStringHelper(this)
                     .add("rowsAdded", rowsAdded)
                     .add("pagesAdded", pagesAdded)
+                    .add("outputBufferPeakMemoryUsage", outputBufferPeakMemoryUsage)
                     .toString();
         }
     }

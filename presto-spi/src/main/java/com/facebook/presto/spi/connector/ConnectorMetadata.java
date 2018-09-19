@@ -14,7 +14,6 @@
 package com.facebook.presto.spi.connector;
 
 import com.facebook.presto.spi.ColumnHandle;
-import com.facebook.presto.spi.ColumnIdentity;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.ConnectorInsertTableHandle;
 import com.facebook.presto.spi.ConnectorNewTableLayout;
@@ -31,11 +30,13 @@ import com.facebook.presto.spi.Constraint;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.SchemaTablePrefix;
-import com.facebook.presto.spi.TableIdentity;
+import com.facebook.presto.spi.SystemTable;
 import com.facebook.presto.spi.predicate.TupleDomain;
 import com.facebook.presto.spi.security.GrantInfo;
 import com.facebook.presto.spi.security.Privilege;
+import com.facebook.presto.spi.statistics.ComputedStatistics;
 import com.facebook.presto.spi.statistics.TableStatistics;
+import com.facebook.presto.spi.statistics.TableStatisticsMetadata;
 import io.airlift.slice.Slice;
 
 import java.util.Collection;
@@ -75,6 +76,17 @@ public interface ConnectorMetadata
     ConnectorTableHandle getTableHandle(ConnectorSession session, SchemaTableName tableName);
 
     /**
+     * Returns the system table for the specified table name, if one exists.
+     * The system tables handled via {@link #getSystemTable} differ form those returned by {@link Connector#getSystemTables()}.
+     * The former mechanism allows dynamic resolution of system tables, while the latter is
+     * based on static list of system tables built during startup.
+     */
+    default Optional<SystemTable> getSystemTable(ConnectorSession session, SchemaTableName tableName)
+    {
+        return Optional.empty();
+    }
+
+    /**
      * Return a list of table layouts that satisfy the given constraint.
      * <p>
      * For each layout, connectors must return an "unenforced constraint" representing the part of the constraint summary that isn't guaranteed by the layout.
@@ -106,8 +118,21 @@ public interface ConnectorMetadata
 
     /**
      * List table names, possibly filtered by schema. An empty list is returned if none match.
+     * @deprecated replaced by {@link ConnectorMetadata#listTables(ConnectorSession, Optional)}
      */
-    List<SchemaTableName> listTables(ConnectorSession session, String schemaNameOrNull);
+    @Deprecated
+    default List<SchemaTableName> listTables(ConnectorSession session, String schemaNameOrNull)
+    {
+        return emptyList();
+    }
+
+    /**
+     * List table names, possibly filtered by schema. An empty list is returned if none match.
+     */
+    default List<SchemaTableName> listTables(ConnectorSession session, Optional<String> schemaName)
+    {
+        return listTables(session, schemaName.orElse(null));
+    }
 
     /**
      * Gets all of the columns on the specified table, or an empty map if the columns can not be enumerated.
@@ -253,6 +278,14 @@ public interface ConnectorMetadata
     }
 
     /**
+     * Describes statistics that must be collected during a write.
+     */
+    default TableStatisticsMetadata getStatisticsCollectionMetadata(ConnectorSession session, ConnectorTableMetadata tableMetadata)
+    {
+        return TableStatisticsMetadata.empty();
+    }
+
+    /**
      * Begin the atomic creation of a table with data.
      */
     default ConnectorOutputTableHandle beginCreateTable(ConnectorSession session, ConnectorTableMetadata tableMetadata, Optional<ConnectorNewTableLayout> layout)
@@ -263,7 +296,7 @@ public interface ConnectorMetadata
     /**
      * Finish a table creation with data after the data is written.
      */
-    default Optional<ConnectorOutputMetadata> finishCreateTable(ConnectorSession session, ConnectorOutputTableHandle tableHandle, Collection<Slice> fragments)
+    default Optional<ConnectorOutputMetadata> finishCreateTable(ConnectorSession session, ConnectorOutputTableHandle tableHandle, Collection<Slice> fragments, Collection<ComputedStatistics> computedStatistics)
     {
         throw new PrestoException(GENERIC_INTERNAL_ERROR, "ConnectorMetadata beginCreateTable() is implemented without finishCreateTable()");
     }
@@ -290,7 +323,7 @@ public interface ConnectorMetadata
     /**
      * Finish insert query
      */
-    default Optional<ConnectorOutputMetadata> finishInsert(ConnectorSession session, ConnectorInsertTableHandle insertHandle, Collection<Slice> fragments)
+    default Optional<ConnectorOutputMetadata> finishInsert(ConnectorSession session, ConnectorInsertTableHandle insertHandle, Collection<Slice> fragments, Collection<ComputedStatistics> computedStatistics)
     {
         throw new PrestoException(GENERIC_INTERNAL_ERROR, "ConnectorMetadata beginInsert() is implemented without finishInsert()");
     }
@@ -341,10 +374,17 @@ public interface ConnectorMetadata
 
     /**
      * List view names, possibly filtered by schema. An empty list is returned if none match.
+     * @deprecated replaced by {@link ConnectorMetadata#listViews(ConnectorSession, Optional)}
      */
+    @Deprecated
     default List<SchemaTableName> listViews(ConnectorSession session, String schemaNameOrNull)
     {
         return emptyList();
+    }
+
+    default List<SchemaTableName> listViews(ConnectorSession session, Optional<String> schemaName)
+    {
+        return listViews(session, schemaName.orElse(null));
     }
 
     /**
@@ -403,37 +443,5 @@ public interface ConnectorMetadata
     default List<GrantInfo> listTablePrivileges(ConnectorSession session, SchemaTablePrefix prefix)
     {
         return emptyList();
-    }
-
-    /**
-     * Gets the table identity on the specified table
-     */
-    default TableIdentity getTableIdentity(ConnectorTableHandle connectorTableHandle)
-    {
-        throw new PrestoException(NOT_SUPPORTED, "This connector does not support table identity");
-    }
-
-    /**
-     * Deserialize the specified bytes to TableIdentity
-     */
-    default TableIdentity deserializeTableIdentity(byte[] bytes)
-    {
-        throw new PrestoException(NOT_SUPPORTED, "This connector does not support table identity");
-    }
-
-    /**
-     * Gets the column identity on the specified column
-     */
-    default ColumnIdentity getColumnIdentity(ColumnHandle columnHandle)
-    {
-        throw new PrestoException(NOT_SUPPORTED, "This connector does not support column identity");
-    }
-
-    /**
-     * Deserialize the specified bytes to ColumnIdentity
-     */
-    default ColumnIdentity deserializeColumnIdentity(byte[] bytes)
-    {
-        throw new PrestoException(NOT_SUPPORTED, "This connector does not support column identity");
     }
 }

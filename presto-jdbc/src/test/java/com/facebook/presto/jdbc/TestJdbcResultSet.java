@@ -107,11 +107,12 @@ public class TestJdbcResultSet
         checkRepresentation("123", Types.INTEGER, 123);
         checkRepresentation("12300000000", Types.BIGINT, 12300000000L);
         checkRepresentation("REAL '123.45'", Types.REAL, 123.45f);
-        checkRepresentation("0.1", Types.DOUBLE, 0.1);
+        checkRepresentation("1e-1", Types.DOUBLE, 0.1);
         checkRepresentation("1.0E0 / 0.0E0", Types.DOUBLE, Double.POSITIVE_INFINITY);
         checkRepresentation("0.0E0 / 0.0E0", Types.DOUBLE, Double.NaN);
+        checkRepresentation("0.1", Types.DECIMAL, new BigDecimal("0.1"));
         checkRepresentation("true", Types.BOOLEAN, true);
-        checkRepresentation("'hello'", Types.LONGNVARCHAR, "hello");
+        checkRepresentation("'hello'", Types.VARCHAR, "hello");
         checkRepresentation("cast('foo' as char(5))", Types.CHAR, "foo  ");
         checkRepresentation("ARRAY[1, 2]", Types.ARRAY, (rs, column) -> assertEquals(rs.getArray(column).getArray(), new int[] {1, 2}));
         checkRepresentation("DECIMAL '0.1'", Types.DECIMAL, new BigDecimal("0.1"));

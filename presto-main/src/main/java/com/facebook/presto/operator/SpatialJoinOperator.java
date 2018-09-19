@@ -18,6 +18,7 @@ import com.facebook.presto.spi.Page;
 import com.facebook.presto.spi.PageBuilder;
 import com.facebook.presto.spi.block.Block;
 import com.facebook.presto.spi.type.Type;
+import com.facebook.presto.sql.planner.plan.JoinNode;
 import com.facebook.presto.sql.planner.plan.PlanNodeId;
 import com.google.common.collect.ImmutableList;
 import com.google.common.util.concurrent.ListenableFuture;
@@ -26,9 +27,11 @@ import javax.annotation.Nullable;
 
 import java.util.List;
 
+import static com.facebook.presto.sql.planner.plan.JoinNode.Type.INNER;
+import static com.facebook.presto.sql.planner.plan.JoinNode.Type.LEFT;
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.base.Verify.verify;
-import static com.google.common.collect.ImmutableList.toImmutableList;
 import static io.airlift.concurrent.MoreFutures.getDone;
 import static io.airlift.slice.SizeOf.sizeOf;
 
@@ -40,10 +43,9 @@ public class SpatialJoinOperator
     {
         private final int operatorId;
         private final PlanNodeId planNodeId;
+        private final JoinNode.Type joinType;
         private final List<Type> probeTypes;
         private final List<Integer> probeOutputChannels;
-        private final List<Type> probeOutputTypes;
-        private final List<Type> buildOutputTypes;
         private final int probeGeometryChannel;
         private final PagesSpatialIndexFactory pagesSpatialIndexFactory;
 
@@ -52,30 +54,20 @@ public class SpatialJoinOperator
         public SpatialJoinOperatorFactory(
                 int operatorId,
                 PlanNodeId planNodeId,
+                JoinNode.Type joinType,
                 List<Type> probeTypes,
                 List<Integer> probeOutputChannels,
                 int probeGeometryChannel,
                 PagesSpatialIndexFactory pagesSpatialIndexFactory)
         {
+            checkArgument(joinType == INNER || joinType == LEFT, "unsupported join type: %s", joinType);
             this.operatorId = operatorId;
             this.planNodeId = planNodeId;
+            this.joinType = joinType;
             this.probeTypes = ImmutableList.copyOf(probeTypes);
-            this.probeOutputTypes = probeOutputChannels.stream()
-                    .map(probeTypes::get)
-                    .collect(toImmutableList());
-            this.buildOutputTypes = pagesSpatialIndexFactory.getOutputTypes();
             this.probeOutputChannels = ImmutableList.copyOf(probeOutputChannels);
             this.probeGeometryChannel = probeGeometryChannel;
             this.pagesSpatialIndexFactory = pagesSpatialIndexFactory;
-        }
-
-        @Override
-        public List<Type> getTypes()
-        {
-            return ImmutableList.<Type>builder()
-                    .addAll(probeOutputTypes)
-                    .addAll(buildOutputTypes)
-                    .build();
         }
 
         @Override
@@ -88,7 +80,7 @@ public class SpatialJoinOperator
                     SpatialJoinOperator.class.getSimpleName());
             return new SpatialJoinOperator(
                     operatorContext,
-                    getTypes(),
+                    joinType,
                     probeTypes,
                     probeOutputChannels,
                     probeGeometryChannel,
@@ -109,14 +101,14 @@ public class SpatialJoinOperator
         @Override
         public OperatorFactory duplicate()
         {
-            return new SpatialJoinOperatorFactory(operatorId, planNodeId, probeTypes, probeOutputChannels, probeGeometryChannel, pagesSpatialIndexFactory);
+            return new SpatialJoinOperatorFactory(operatorId, planNodeId, joinType, probeTypes, probeOutputChannels, probeGeometryChannel, pagesSpatialIndexFactory);
         }
     }
 
     private final OperatorContext operatorContext;
     private final LocalMemoryContext localUserMemoryContext;
+    private final JoinNode.Type joinType;
     private final List<Type> probeTypes;
-    private final List<Type> outputTypes;
     private final List<Integer> probeOutputChannels;
     private final int probeGeometryChannel;
     private final PagesSpatialIndexFactory pagesSpatialIndexFactory;
@@ -130,15 +122,16 @@ public class SpatialJoinOperator
     // filled up pageBuilder before processing all records in a probe page.
     private int probePosition;
     @Nullable
-    private long[] joinAddresses;
-    private int nextJoinAddressIndex;
+    private int[] joinPositions;
+    private int nextJoinPositionIndex;
+    private boolean matchFound;
 
     private boolean finishing;
     private boolean finished;
 
     public SpatialJoinOperator(
             OperatorContext operatorContext,
-            List<Type> outputTypes,
+            JoinNode.Type joinType,
             List<Type> probeTypes,
             List<Integer> probeOutputChannels,
             int probeGeometryChannel,
@@ -146,25 +139,24 @@ public class SpatialJoinOperator
     {
         this.operatorContext = operatorContext;
         this.localUserMemoryContext = operatorContext.localUserMemoryContext();
+        this.joinType = joinType;
         this.probeTypes = ImmutableList.copyOf(probeTypes);
         this.probeOutputChannels = ImmutableList.copyOf(probeOutputChannels);
         this.probeGeometryChannel = probeGeometryChannel;
         this.pagesSpatialIndexFactory = pagesSpatialIndexFactory;
         this.pagesSpatialIndexFuture = pagesSpatialIndexFactory.createPagesSpatialIndex();
-        this.outputTypes = ImmutableList.copyOf(outputTypes);
-        this.pageBuilder = new PageBuilder(outputTypes);
+        this.pageBuilder = new PageBuilder(ImmutableList.<Type>builder()
+                .addAll(probeOutputChannels.stream()
+                        .map(probeTypes::get)
+                        .iterator())
+                .addAll(pagesSpatialIndexFactory.getOutputTypes())
+                .build());
     }
 
     @Override
     public OperatorContext getOperatorContext()
     {
         return operatorContext;
-    }
-
-    @Override
-    public List<Type> getTypes()
-    {
-        return outputTypes;
     }
 
     @Override
@@ -180,7 +172,7 @@ public class SpatialJoinOperator
         probe = page;
         probePosition = 0;
 
-        joinAddresses = null;
+        joinPositions = null;
     }
 
     @Override
@@ -219,48 +211,68 @@ public class SpatialJoinOperator
         PagesSpatialIndex pagesSpatialIndex = getDone(pagesSpatialIndexFuture);
         DriverYieldSignal yieldSignal = operatorContext.getDriverContext().getYieldSignal();
         while (probePosition < probe.getPositionCount()) {
-            if (joinAddresses == null) {
-                joinAddresses = pagesSpatialIndex.findJoinAddresses(probePosition, probe, probeGeometryChannel);
-                localUserMemoryContext.setBytes(sizeOf(joinAddresses));
-                nextJoinAddressIndex = 0;
+            if (joinPositions == null) {
+                joinPositions = pagesSpatialIndex.findJoinPositions(probePosition, probe, probeGeometryChannel);
+                localUserMemoryContext.setBytes(sizeOf(joinPositions));
+                nextJoinPositionIndex = 0;
+                matchFound = false;
                 if (yieldSignal.isSet()) {
                     return;
                 }
             }
 
-            while (nextJoinAddressIndex < joinAddresses.length) {
+            while (nextJoinPositionIndex < joinPositions.length) {
                 if (pageBuilder.isFull()) {
                     return;
                 }
 
-                long joinAddress = joinAddresses[nextJoinAddressIndex];
+                int joinPosition = joinPositions[nextJoinPositionIndex];
 
-                if (pagesSpatialIndex.isJoinAddressEligible(joinAddress, probePosition, probe)) {
+                if (pagesSpatialIndex.isJoinPositionEligible(joinPosition, probePosition, probe)) {
                     pageBuilder.declarePosition();
-                    int outputChannelOffset = 0;
-                    for (int outputIndex : probeOutputChannels) {
-                        Type type = probeTypes.get(outputIndex);
-                        Block block = probe.getBlock(outputIndex);
-                        type.appendTo(block, probePosition, pageBuilder.getBlockBuilder(outputChannelOffset));
-                        outputChannelOffset++;
-                    }
-                    pagesSpatialIndex.appendTo(joinAddress, pageBuilder, outputChannelOffset);
+                    appendProbe();
+                    pagesSpatialIndex.appendTo(joinPosition, pageBuilder, probeOutputChannels.size());
+                    matchFound = true;
                 }
 
-                nextJoinAddressIndex++;
+                nextJoinPositionIndex++;
 
                 if (yieldSignal.isSet()) {
                     return;
                 }
             }
 
-            joinAddresses = null;
+            if (!matchFound && joinType == LEFT) {
+                if (pageBuilder.isFull()) {
+                    return;
+                }
+
+                pageBuilder.declarePosition();
+                appendProbe();
+                int buildColumnCount = pagesSpatialIndexFactory.getOutputTypes().size();
+                for (int i = 0; i < buildColumnCount; i++) {
+                    pageBuilder.getBlockBuilder(probeOutputChannels.size() + i).appendNull();
+                }
+            }
+
+            joinPositions = null;
             localUserMemoryContext.setBytes(0);
             probePosition++;
         }
 
         this.probe = null;
         this.probePosition = 0;
+    }
+
+    private void appendProbe()
+    {
+        int outputChannelOffset = 0;
+        for (int outputIndex : probeOutputChannels) {
+            Type type = probeTypes.get(outputIndex);
+            Block block = probe.getBlock(outputIndex);
+            type.appendTo(block, probePosition, pageBuilder.getBlockBuilder(outputChannelOffset));
+            outputChannelOffset++;
+        }
     }
 
     @Override

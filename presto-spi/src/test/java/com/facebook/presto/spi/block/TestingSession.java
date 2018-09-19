@@ -36,6 +36,12 @@ public final class TestingSession
         }
 
         @Override
+        public String getPath()
+        {
+            return "path";
+        }
+
+        @Override
         public Optional<String> getSource()
         {
             return Optional.of("TestSource");
@@ -63,6 +69,12 @@ public final class TestingSession
         public long getStartTime()
         {
             return 0;
+        }
+
+        @Override
+        public Optional<String> getTraceToken()
+        {
+            return Optional.empty();
         }
 
         @Override

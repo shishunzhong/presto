@@ -15,13 +15,14 @@ package com.facebook.presto.operator;
 
 import com.esri.core.geometry.ogc.OGCGeometry;
 import com.facebook.presto.Session;
-import com.facebook.presto.geospatial.GeometryUtils;
+import com.facebook.presto.operator.SpatialIndexBuilderOperator.SpatialPredicate;
 import com.facebook.presto.spi.Page;
 import com.facebook.presto.spi.PageBuilder;
 import com.facebook.presto.spi.block.Block;
 import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.sql.gen.JoinFilterFunctionCompiler.JoinFilterFunctionFactory;
 import io.airlift.slice.Slice;
+import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import org.locationtech.jts.geom.Envelope;
 import org.locationtech.jts.index.strtree.STRtree;
@@ -29,42 +30,44 @@ import org.openjdk.jol.info.ClassLayout;
 
 import java.util.List;
 import java.util.Optional;
-import java.util.function.BiPredicate;
+import java.util.OptionalDouble;
 
-import static com.facebook.presto.geospatial.GeometryUtils.deserialize;
+import static com.facebook.presto.geospatial.serde.GeometrySerde.deserialize;
 import static com.facebook.presto.operator.SyntheticAddress.decodePosition;
 import static com.facebook.presto.operator.SyntheticAddress.decodeSliceIndex;
+import static com.facebook.presto.spi.type.DoubleType.DOUBLE;
 import static com.google.common.base.Verify.verify;
-import static java.lang.Math.toIntExact;
 import static java.util.Objects.requireNonNull;
 
 public class PagesRTreeIndex
         implements PagesSpatialIndex
 {
-    private static final long[] EMPTY_ADDRESSES = new long[0];
+    private static final int[] EMPTY_ADDRESSES = new int[0];
 
+    private final LongArrayList addresses;
     private final List<Type> types;
     private final List<Integer> outputChannels;
     private final List<List<Block>> channels;
     private final STRtree rtree;
-    private final BiPredicate<OGCGeometry, OGCGeometry> spatialRelationshipTest;
+    private final int radiusChannel;
+    private final SpatialPredicate spatialRelationshipTest;
     private final JoinFilterFunction filterFunction;
 
-    public static final class GeometryWithAddress
+    public static final class GeometryWithPosition
     {
-        private static final int INSTANCE_SIZE = ClassLayout.parseClass(GeometryWithAddress.class).instanceSize();
+        private static final int INSTANCE_SIZE = ClassLayout.parseClass(GeometryWithPosition.class).instanceSize();
         private final OGCGeometry ogcGeometry;
-        private final long address;
+        private final int position;
 
-        public GeometryWithAddress(OGCGeometry ogcGeometry, long address)
+        public GeometryWithPosition(OGCGeometry ogcGeometry, int position)
         {
             this.ogcGeometry = ogcGeometry;
-            this.address = address;
+            this.position = position;
         }
 
         public long getEstimatedMemorySizeInBytes()
         {
-            return INSTANCE_SIZE + GeometryUtils.getEstimatedMemorySizeInBytes(ogcGeometry);
+            return INSTANCE_SIZE + ogcGeometry.estimateMemorySize();
         }
     }
 
@@ -75,13 +78,16 @@ public class PagesRTreeIndex
             List<Integer> outputChannels,
             List<List<Block>> channels,
             STRtree rtree,
-            BiPredicate<OGCGeometry, OGCGeometry> spatialRelationshipTest,
+            Optional<Integer> radiusChannel,
+            SpatialPredicate spatialRelationshipTest,
             Optional<JoinFilterFunctionFactory> filterFunctionFactory)
     {
+        this.addresses = requireNonNull(addresses, "addresses is null");
         this.types = types;
         this.outputChannels = outputChannels;
         this.channels = requireNonNull(channels, "channels is null");
         this.rtree = requireNonNull(rtree, "rtree is null");
+        this.radiusChannel = radiusChannel.orElse(-1);
         this.spatialRelationshipTest = requireNonNull(spatialRelationshipTest, "spatial relationship is null");
         this.filterFunction = filterFunctionFactory.map(factory -> factory.create(session.toConnectorSession(), addresses, channels)).orElse(null);
     }
@@ -98,11 +104,11 @@ public class PagesRTreeIndex
      * Returns an array of addresses from {@link PagesIndex#valueAddresses} corresponding
      * to rows with matching geometries.
      * <p>
-     * The caller is responsible for calling {@link #isJoinAddressEligible(long, int, Page)}
+     * The caller is responsible for calling {@link #isJoinPositionEligible(int, int, Page)}
      * for each of these addresses to apply additional join filters.
      */
     @Override
-    public long[] findJoinAddresses(int probePosition, Page probe, int probeGeometryChannel)
+    public int[] findJoinPositions(int probePosition, Page probe, int probeGeometryChannel)
     {
         Block probeGeometryBlock = probe.getBlock(probeGeometryChannel);
         if (probeGeometryBlock.isNull(probePosition)) {
@@ -116,28 +122,48 @@ public class PagesRTreeIndex
             return EMPTY_ADDRESSES;
         }
 
-        LongArrayList matchingAddresses = new LongArrayList();
+        IntArrayList matchingPositions = new IntArrayList();
 
         Envelope envelope = getEnvelope(probeGeometry);
-        rtree.query(envelope, item -> {
-            GeometryWithAddress geometryWithAddress = (GeometryWithAddress) item;
-            if (spatialRelationshipTest.test(geometryWithAddress.ogcGeometry, probeGeometry)) {
-                matchingAddresses.add(geometryWithAddress.address);
-            }
-        });
+        if (radiusChannel == -1) {
+            rtree.query(envelope, item -> {
+                GeometryWithPosition geometryWithPosition = (GeometryWithPosition) item;
+                if (spatialRelationshipTest.apply(geometryWithPosition.ogcGeometry, probeGeometry, OptionalDouble.empty())) {
+                    matchingPositions.add(geometryWithPosition.position);
+                }
+            });
+        }
+        else {
+            rtree.query(envelope, item -> {
+                GeometryWithPosition geometryWithPosition = (GeometryWithPosition) item;
+                if (spatialRelationshipTest.apply(geometryWithPosition.ogcGeometry, probeGeometry, OptionalDouble.of(getRadius(geometryWithPosition.position)))) {
+                    matchingPositions.add(geometryWithPosition.position);
+                }
+            });
+        }
 
-        return matchingAddresses.toLongArray(null);
+        return matchingPositions.toIntArray(null);
+    }
+
+    private double getRadius(int joinPosition)
+    {
+        long joinAddress = addresses.getLong(joinPosition);
+        int blockIndex = decodeSliceIndex(joinAddress);
+        int blockPosition = decodePosition(joinAddress);
+
+        return DOUBLE.getDouble(channels.get(radiusChannel).get(blockIndex), blockPosition);
     }
 
     @Override
-    public boolean isJoinAddressEligible(long joinAddress, int probePosition, Page probe)
+    public boolean isJoinPositionEligible(int joinPosition, int probePosition, Page probe)
     {
-        return filterFunction == null || filterFunction.filter(toIntExact(joinAddress), probePosition, probe);
+        return filterFunction == null || filterFunction.filter(joinPosition, probePosition, probe);
     }
 
     @Override
-    public void appendTo(long joinAddress, PageBuilder pageBuilder, int outputChannelOffset)
+    public void appendTo(int joinPosition, PageBuilder pageBuilder, int outputChannelOffset)
     {
+        long joinAddress = addresses.getLong(joinPosition);
         int blockIndex = decodeSliceIndex(joinAddress);
         int blockPosition = decodePosition(joinAddress);
 

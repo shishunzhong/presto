@@ -14,9 +14,8 @@
 package com.facebook.presto.memory;
 
 import com.facebook.presto.Session;
-import com.facebook.presto.execution.QueryInfo;
-import com.facebook.presto.execution.TaskInfo;
-import com.facebook.presto.operator.DriverStats;
+import com.facebook.presto.server.BasicQueryInfo;
+import com.facebook.presto.server.BasicQueryStats;
 import com.facebook.presto.server.testing.TestingPrestoServer;
 import com.facebook.presto.spi.QueryId;
 import com.facebook.presto.testing.QueryRunner;
@@ -25,6 +24,8 @@ import com.facebook.presto.tpch.TpchPlugin;
 import com.google.common.collect.ImmutableMap;
 import org.intellij.lang.annotations.Language;
 import org.testng.annotations.AfterClass;
+import org.testng.annotations.BeforeClass;
+import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
 import java.util.ArrayList;
@@ -36,10 +37,8 @@ import java.util.concurrent.Future;
 
 import static com.facebook.presto.SystemSessionProperties.RESOURCE_OVERCOMMIT;
 import static com.facebook.presto.execution.QueryState.FINISHED;
-import static com.facebook.presto.execution.StageInfo.getAllStages;
 import static com.facebook.presto.memory.LocalMemoryManager.GENERAL_POOL;
 import static com.facebook.presto.memory.LocalMemoryManager.RESERVED_POOL;
-import static com.facebook.presto.memory.LocalMemoryManager.SYSTEM_POOL;
 import static com.facebook.presto.operator.BlockedReason.WAITING_FOR_MEMORY;
 import static com.facebook.presto.spi.StandardErrorCode.CLUSTER_OUT_OF_MEMORY;
 import static com.facebook.presto.testing.TestingSession.testSessionBuilder;
@@ -67,7 +66,20 @@ public class TestMemoryManager
             .setSchema("tiny")
             .build();
 
-    private final ExecutorService executor = newCachedThreadPool();
+    private ExecutorService executor;
+
+    @BeforeClass
+    public void setUp()
+    {
+        executor = newCachedThreadPool();
+    }
+
+    @AfterClass(alwaysRun = true)
+    public void shutdown()
+    {
+        executor.shutdownNow();
+        executor = null;
+    }
 
     @Test(timeOut = 240_000)
     public void testResourceOverCommit()
@@ -75,6 +87,7 @@ public class TestMemoryManager
     {
         Map<String, String> properties = ImmutableMap.<String, String>builder()
                 .put("query.max-memory-per-node", "1kB")
+                .put("query.max-total-memory-per-node", "1kB")
                 .put("query.max-memory", "1kB")
                 .build();
 
@@ -110,7 +123,7 @@ public class TestMemoryManager
             QueryId fakeQueryId = new QueryId("fake");
             for (TestingPrestoServer server : queryRunner.getServers()) {
                 for (MemoryPool pool : server.getLocalMemoryManager().getPools()) {
-                    assertTrue(pool.tryReserve(fakeQueryId, pool.getMaxBytes()));
+                    assertTrue(pool.tryReserve(fakeQueryId, "test", pool.getMaxBytes()));
                 }
             }
 
@@ -122,7 +135,7 @@ public class TestMemoryManager
             // Wait for one of the queries to die
             boolean queryDone = false;
             while (!queryDone) {
-                for (QueryInfo info : queryRunner.getCoordinator().getQueryManager().getAllQueryInfo()) {
+                for (BasicQueryInfo info : queryRunner.getCoordinator().getQueryManager().getQueries()) {
                     if (info.getState().isDone()) {
                         assertNotNull(info.getErrorCode());
                         assertEquals(info.getErrorCode().getCode(), CLUSTER_OUT_OF_MEMORY.toErrorCode().getCode());
@@ -137,7 +150,7 @@ public class TestMemoryManager
             for (TestingPrestoServer server : queryRunner.getServers()) {
                 MemoryPool reserved = server.getLocalMemoryManager().getPool(RESERVED_POOL);
                 // Free up the entire pool
-                reserved.free(fakeQueryId, reserved.getMaxBytes());
+                reserved.free(fakeQueryId, "test", reserved.getMaxBytes());
                 assertTrue(reserved.getFreeBytes() > 0);
             }
 
@@ -165,8 +178,7 @@ public class TestMemoryManager
         try (DistributedQueryRunner queryRunner = createQueryRunner(TINY_SESSION, properties)) {
             executor.submit(() -> queryRunner.execute(query)).get();
 
-            List<QueryInfo> queryInfos = queryRunner.getCoordinator().getQueryManager().getAllQueryInfo();
-            for (QueryInfo info : queryInfos) {
+            for (BasicQueryInfo info : queryRunner.getCoordinator().getQueryManager().getQueries()) {
                 assertEquals(info.getState(), FINISHED);
             }
 
@@ -176,8 +188,6 @@ public class TestMemoryManager
                 assertEquals(reserved.getMaxBytes(), reserved.getFreeBytes());
                 MemoryPool general = worker.getLocalMemoryManager().getPool(GENERAL_POOL);
                 assertEquals(general.getMaxBytes(), general.getFreeBytes());
-                MemoryPool system = worker.getLocalMemoryManager().getPool(SYSTEM_POOL);
-                assertEquals(system.getMaxBytes(), system.getFreeBytes());
             }
         }
     }
@@ -195,7 +205,7 @@ public class TestMemoryManager
             QueryId fakeQueryId = new QueryId("fake");
             for (TestingPrestoServer server : queryRunner.getServers()) {
                 for (MemoryPool pool : server.getLocalMemoryManager().getPools()) {
-                    assertTrue(pool.tryReserve(fakeQueryId, pool.getMaxBytes()));
+                    assertTrue(pool.tryReserve(fakeQueryId, "test", pool.getMaxBytes()));
                 }
             }
 
@@ -219,33 +229,28 @@ public class TestMemoryManager
             }
 
             // Make sure the queries are blocked
-            List<QueryInfo> currentQueryInfos = queryRunner.getCoordinator().getQueryManager().getAllQueryInfo();
-            for (QueryInfo info : currentQueryInfos) {
+            List<BasicQueryInfo> currentQueryInfos = queryRunner.getCoordinator().getQueryManager().getQueries();
+            for (BasicQueryInfo info : currentQueryInfos) {
                 assertFalse(info.getState().isDone());
             }
             assertEquals(currentQueryInfos.size(), 2);
             // Check that the pool information propagated to the query objects
             assertNotEquals(currentQueryInfos.get(0).getMemoryPool(), currentQueryInfos.get(1).getMemoryPool());
 
-            while (!allQueriesBlocked(currentQueryInfos)) {
+            while (!currentQueryInfos.stream().allMatch(TestMemoryManager::isBlockedWaitingForMemory)) {
                 MILLISECONDS.sleep(10);
-                currentQueryInfos = queryRunner.getCoordinator().getQueryManager().getAllQueryInfo();
-                for (QueryInfo info : currentQueryInfos) {
+                currentQueryInfos = queryRunner.getCoordinator().getQueryManager().getQueries();
+                for (BasicQueryInfo info : currentQueryInfos) {
                     assertFalse(info.getState().isDone());
                 }
             }
 
-            // Release the memory in the reserved pool and the system pool
+            // Release the memory in the reserved pool
             for (TestingPrestoServer server : queryRunner.getServers()) {
                 MemoryPool reserved = server.getLocalMemoryManager().getPool(RESERVED_POOL);
                 // Free up the entire pool
-                reserved.free(fakeQueryId, reserved.getMaxBytes());
+                reserved.free(fakeQueryId, "test", reserved.getMaxBytes());
                 assertTrue(reserved.getFreeBytes() > 0);
-
-                MemoryPool system = server.getLocalMemoryManager().getPool(SYSTEM_POOL);
-                // Free up the entire pool
-                system.free(fakeQueryId, system.getMaxBytes());
-                assertTrue(system.getFreeBytes() > 0);
             }
 
             // Make sure both queries finish now that there's memory free in the reserved pool.
@@ -254,8 +259,7 @@ public class TestMemoryManager
                 query.get();
             }
 
-            List<QueryInfo> queryInfos = queryRunner.getCoordinator().getQueryManager().getAllQueryInfo();
-            for (QueryInfo info : queryInfos) {
+            for (BasicQueryInfo info : queryRunner.getCoordinator().getQueryManager().getQueries()) {
                 assertEquals(info.getState(), FINISHED);
             }
 
@@ -265,49 +269,59 @@ public class TestMemoryManager
                 assertEquals(reserved.getMaxBytes(), reserved.getFreeBytes());
                 MemoryPool general = worker.getLocalMemoryManager().getPool(GENERAL_POOL);
                 // Free up the memory we reserved earlier
-                general.free(fakeQueryId, general.getMaxBytes());
+                general.free(fakeQueryId, "test", general.getMaxBytes());
                 assertEquals(general.getMaxBytes(), general.getFreeBytes());
-                MemoryPool system = worker.getLocalMemoryManager().getPool(SYSTEM_POOL);
-                assertEquals(system.getMaxBytes(), system.getFreeBytes());
             }
         }
     }
 
-    private static boolean allQueriesBlocked(List<QueryInfo> current)
+    private static boolean isBlockedWaitingForMemory(BasicQueryInfo info)
     {
-        boolean allDriversBlocked = current.stream()
-                .flatMap(query -> getAllStages(query.getOutputStage()).stream())
-                .flatMap(stage -> stage.getTasks().stream())
-                .flatMap(task -> task.getStats().getPipelines().stream())
-                .flatMap(pipeline -> pipeline.getDrivers().stream())
-                .allMatch(DriverStats::isFullyBlocked);
-        boolean waitingForMemory = current.stream().allMatch(TestMemoryManager::atLeastOneOperatorWaitingForMemory);
+        BasicQueryStats stats = info.getQueryStats();
+        boolean isWaitingForMemory = stats.getBlockedReasons().contains(WAITING_FOR_MEMORY);
+        if (!isWaitingForMemory) {
+            return false;
+        }
 
-        return allDriversBlocked && waitingForMemory;
+        // queries are not marked as fully blocked if there are no running drivers
+        return stats.isFullyBlocked() || stats.getRunningDrivers() == 0;
     }
 
-    private static boolean atLeastOneOperatorWaitingForMemory(QueryInfo query)
+    @DataProvider(name = "legacy_system_pool_enabled")
+    public Object[][] legacySystemPoolEnabled()
     {
-        return getAllStages(query.getOutputStage()).stream()
-                .flatMap(stage -> stage.getTasks().stream())
-                .map(TaskInfo::getStats)
-                .anyMatch(task -> task.getBlockedReasons().contains(WAITING_FOR_MEMORY));
+        return new Object[][] {{true}, {false}};
     }
 
-    @Test(timeOut = 60_000, expectedExceptions = RuntimeException.class, expectedExceptionsMessageRegExp = ".*Query exceeded max memory size of 1kB.*")
-    public void testQueryMemoryLimit()
+    @Test(timeOut = 60_000, dataProvider = "legacy_system_pool_enabled", expectedExceptions = RuntimeException.class, expectedExceptionsMessageRegExp = ".*Query exceeded distributed user memory limit of 1kB.*")
+    public void testQueryUserMemoryLimit(boolean systemPoolEnabled)
             throws Exception
     {
         Map<String, String> properties = ImmutableMap.<String, String>builder()
                 .put("task.max-partial-aggregation-memory", "1B")
                 .put("query.max-memory", "1kB")
+                .put("query.max-total-memory", "1GB")
+                .put("deprecated.legacy-system-pool-enabled", String.valueOf(systemPoolEnabled))
                 .build();
         try (QueryRunner queryRunner = createQueryRunner(SESSION, properties)) {
             queryRunner.execute(SESSION, "SELECT COUNT(*), repeat(orderstatus, 1000) FROM orders GROUP BY 2");
         }
     }
 
-    @Test(timeOut = 60_000, expectedExceptions = RuntimeException.class, expectedExceptionsMessageRegExp = ".*Query exceeded local memory limit of 1kB.*")
+    @Test(timeOut = 60_000, expectedExceptions = RuntimeException.class, expectedExceptionsMessageRegExp = ".*Query exceeded distributed total memory limit of 2kB.*")
+    public void testQueryTotalMemoryLimit()
+            throws Exception
+    {
+        Map<String, String> properties = ImmutableMap.<String, String>builder()
+                .put("query.max-memory", "1kB")
+                .put("query.max-total-memory", "2kB")
+                .build();
+        try (QueryRunner queryRunner = createQueryRunner(SESSION, properties)) {
+            queryRunner.execute(SESSION, "SELECT COUNT(*), repeat(orderstatus, 1000) FROM orders GROUP BY 2");
+        }
+    }
+
+    @Test(timeOut = 60_000, expectedExceptions = RuntimeException.class, expectedExceptionsMessageRegExp = ".*Query exceeded per-node user memory limit of 1kB.*")
     public void testQueryMemoryPerNodeLimit()
             throws Exception
     {
@@ -318,12 +332,6 @@ public class TestMemoryManager
         try (QueryRunner queryRunner = createQueryRunner(SESSION, properties)) {
             queryRunner.execute(SESSION, "SELECT COUNT(*), repeat(orderstatus, 1000) FROM orders GROUP BY 2");
         }
-    }
-
-    @AfterClass(alwaysRun = true)
-    public void shutdown()
-    {
-        executor.shutdownNow();
     }
 
     public static DistributedQueryRunner createQueryRunner(Session session, Map<String, String> properties)

@@ -13,6 +13,7 @@
  */
 package com.facebook.presto.memory;
 
+import com.facebook.presto.spi.Node;
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
 import io.airlift.http.client.FullJsonResponseHandler.JsonResponse;
@@ -33,6 +34,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static com.google.common.net.MediaType.JSON_UTF_8;
+import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 import static io.airlift.http.client.FullJsonResponseHandler.createFullJsonResponseHandler;
 import static io.airlift.http.client.HttpStatus.OK;
 import static io.airlift.http.client.JsonBodyGenerator.jsonBodyGenerator;
@@ -49,6 +51,7 @@ public class RemoteNodeMemory
 {
     private static final Logger log = Logger.get(RemoteNodeMemory.class);
 
+    private final Node node;
     private final HttpClient httpClient;
     private final URI memoryInfoUri;
     private final JsonCodec<MemoryInfo> memoryInfoCodec;
@@ -59,8 +62,14 @@ public class RemoteNodeMemory
     private final AtomicLong lastWarningLogged = new AtomicLong();
     private final AtomicLong currentAssignmentVersion = new AtomicLong(-1);
 
-    public RemoteNodeMemory(HttpClient httpClient, JsonCodec<MemoryInfo> memoryInfoCodec, JsonCodec<MemoryPoolAssignmentsRequest> assignmentsRequestJsonCodec, URI memoryInfoUri)
+    public RemoteNodeMemory(
+            Node node,
+            HttpClient httpClient,
+            JsonCodec<MemoryInfo> memoryInfoCodec,
+            JsonCodec<MemoryPoolAssignmentsRequest> assignmentsRequestJsonCodec,
+            URI memoryInfoUri)
     {
+        this.node = requireNonNull(node, "node is null");
         this.httpClient = requireNonNull(httpClient, "httpClient is null");
         this.memoryInfoUri = requireNonNull(memoryInfoUri, "memoryInfoUri is null");
         this.memoryInfoCodec = requireNonNull(memoryInfoCodec, "memoryInfoCodec is null");
@@ -75,6 +84,11 @@ public class RemoteNodeMemory
     public Optional<MemoryInfo> getInfo()
     {
         return memoryInfo.get();
+    }
+
+    public Node getNode()
+    {
+        return node;
     }
 
     public void asyncRefresh(MemoryPoolAssignmentsRequest assignments)
@@ -122,7 +136,7 @@ public class RemoteNodeMemory
                     lastUpdateNanos.set(System.nanoTime());
                     future.compareAndSet(responseFuture, null);
                 }
-            });
+            }, directExecutor());
         }
     }
 }

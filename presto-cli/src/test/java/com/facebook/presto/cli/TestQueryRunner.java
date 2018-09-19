@@ -86,12 +86,15 @@ public class TestQueryRunner
                         server.url("/").uri(),
                         "user",
                         "source",
+                        Optional.empty(),
                         ImmutableSet.of(),
                         "clientInfo",
                         "catalog",
                         "schema",
+                        "path",
                         "America/Los_Angeles",
                         Locale.ENGLISH,
+                        ImmutableMap.of(),
                         ImmutableMap.of(),
                         ImmutableMap.of(),
                         null,
@@ -142,7 +145,7 @@ public class TestQueryRunner
                 Optional.empty(),
                 Optional.empty(),
                 Optional.empty(),
-                false,
+                Optional.empty(),
                 false);
     }
 }

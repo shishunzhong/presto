@@ -60,6 +60,7 @@ import static com.facebook.presto.spi.type.DoubleType.DOUBLE;
 import static com.facebook.presto.spi.type.IntegerType.INTEGER;
 import static com.facebook.presto.spi.type.VarcharType.VARCHAR;
 import static com.facebook.presto.sql.planner.plan.AggregationNode.Step.SINGLE;
+import static com.facebook.presto.sql.planner.plan.AggregationNode.singleGroupingSet;
 
 @Test(singleThreaded = true)
 public class TestTypeValidator
@@ -101,7 +102,7 @@ public class TestTypeValidator
                 assignments,
                 Optional.empty(),
                 TupleDomain.all(),
-                null);
+                TupleDomain.all());
     }
 
     @Test
@@ -158,6 +159,8 @@ public class TestTypeValidator
                 FrameBound.Type.UNBOUNDED_PRECEDING,
                 Optional.empty(),
                 FrameBound.Type.UNBOUNDED_FOLLOWING,
+                Optional.empty(),
+                Optional.empty(),
                 Optional.empty());
 
         WindowNode.Function function = new WindowNode.Function(functionCall, signature, frame);
@@ -195,7 +198,8 @@ public class TestTypeValidator
                                 ImmutableList.of(DOUBLE.getTypeSignature()),
                                 false),
                         Optional.empty())),
-                ImmutableList.of(ImmutableList.of(columnA, columnB)),
+                singleGroupingSet(ImmutableList.of(columnA, columnB)),
+                ImmutableList.of(),
                 SINGLE,
                 Optional.empty(),
                 Optional.empty());
@@ -252,7 +256,8 @@ public class TestTypeValidator
                                 ImmutableList.of(DOUBLE.getTypeSignature()),
                                 false),
                         Optional.empty())),
-                ImmutableList.of(ImmutableList.of(columnA, columnB)),
+                singleGroupingSet(ImmutableList.of(columnA, columnB)),
+                ImmutableList.of(),
                 SINGLE,
                 Optional.empty(),
                 Optional.empty());
@@ -279,7 +284,8 @@ public class TestTypeValidator
                                 ImmutableList.of(DOUBLE.getTypeSignature()),
                                 false),
                         Optional.empty())),
-                ImmutableList.of(ImmutableList.of(columnA, columnB)),
+                singleGroupingSet(ImmutableList.of(columnA, columnB)),
+                ImmutableList.of(),
                 SINGLE,
                 Optional.empty(),
                 Optional.empty());
@@ -306,6 +312,8 @@ public class TestTypeValidator
                 FrameBound.Type.UNBOUNDED_PRECEDING,
                 Optional.empty(),
                 FrameBound.Type.UNBOUNDED_FOLLOWING,
+                Optional.empty(),
+                Optional.empty(),
                 Optional.empty());
 
         WindowNode.Function function = new WindowNode.Function(functionCall, signature, frame);
@@ -343,6 +351,8 @@ public class TestTypeValidator
                 FrameBound.Type.UNBOUNDED_PRECEDING,
                 Optional.empty(),
                 FrameBound.Type.UNBOUNDED_FOLLOWING,
+                Optional.empty(),
+                Optional.empty(),
                 Optional.empty());
 
         WindowNode.Function function = new WindowNode.Function(functionCall, signature, frame);

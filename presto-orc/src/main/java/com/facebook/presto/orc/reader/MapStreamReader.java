@@ -13,6 +13,7 @@
  */
 package com.facebook.presto.orc.reader;
 
+import com.facebook.presto.memory.context.AggregatedMemoryContext;
 import com.facebook.presto.orc.OrcCorruptionException;
 import com.facebook.presto.orc.StreamDescriptor;
 import com.facebook.presto.orc.metadata.ColumnEncoding;
@@ -21,17 +22,20 @@ import com.facebook.presto.orc.stream.InputStreamSource;
 import com.facebook.presto.orc.stream.InputStreamSources;
 import com.facebook.presto.orc.stream.LongInputStream;
 import com.facebook.presto.spi.block.Block;
-import com.facebook.presto.spi.block.BlockBuilderStatus;
 import com.facebook.presto.spi.type.MapType;
 import com.facebook.presto.spi.type.Type;
+import com.google.common.io.Closer;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import org.joda.time.DateTimeZone;
+import org.openjdk.jol.info.ClassLayout;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.List;
+import java.util.Optional;
 
 import static com.facebook.presto.orc.metadata.Stream.StreamKind.LENGTH;
 import static com.facebook.presto.orc.metadata.Stream.StreamKind.PRESENT;
@@ -44,6 +48,8 @@ import static java.util.Objects.requireNonNull;
 public class MapStreamReader
         implements StreamReader
 {
+    private static final int INSTANCE_SIZE = ClassLayout.parseClass(MapStreamReader.class).instanceSize();
+
     private final StreamDescriptor streamDescriptor;
 
     private final StreamReader keyStreamReader;
@@ -64,11 +70,11 @@ public class MapStreamReader
 
     private boolean rowGroupOpen;
 
-    public MapStreamReader(StreamDescriptor streamDescriptor, DateTimeZone hiveStorageTimeZone)
+    public MapStreamReader(StreamDescriptor streamDescriptor, DateTimeZone hiveStorageTimeZone, AggregatedMemoryContext systemMemoryContext)
     {
         this.streamDescriptor = requireNonNull(streamDescriptor, "stream is null");
-        this.keyStreamReader = createStreamReader(streamDescriptor.getNestedStreams().get(0), hiveStorageTimeZone);
-        this.valueStreamReader = createStreamReader(streamDescriptor.getNestedStreams().get(1), hiveStorageTimeZone);
+        this.keyStreamReader = createStreamReader(streamDescriptor.getNestedStreams().get(0), hiveStorageTimeZone, systemMemoryContext);
+        this.valueStreamReader = createStreamReader(streamDescriptor.getNestedStreams().get(1), hiveStorageTimeZone, systemMemoryContext);
     }
 
     @Override
@@ -102,25 +108,25 @@ public class MapStreamReader
             }
         }
 
-        // The length vector could be reused, but this simplifies the code below by
-        // taking advantage of null entries being initialized to zero.  The vector
-        // could be reinitialized for each loop, but that is likely just as expensive
-        // as allocating a new array
-        int[] lengthVector = new int[nextBatchSize];
-        boolean[] nullVector = new boolean[nextBatchSize];
+        // We will use the offsetVector as the buffer to read the length values from lengthStream,
+        // and the length values will be converted in-place to an offset vector.
+        int[] offsetVector = new int[nextBatchSize + 1];
+        boolean[] nullVector = null;
+
         if (presentStream == null) {
             if (lengthStream == null) {
                 throw new OrcCorruptionException(streamDescriptor.getOrcDataSourceId(), "Value is not null but data stream is not present");
             }
-            lengthStream.nextIntVector(nextBatchSize, lengthVector);
+            lengthStream.nextIntVector(nextBatchSize, offsetVector, 0);
         }
         else {
+            nullVector = new boolean[nextBatchSize];
             int nullValues = presentStream.getUnsetBits(nextBatchSize, nullVector);
             if (nullValues != nextBatchSize) {
                 if (lengthStream == null) {
                     throw new OrcCorruptionException(streamDescriptor.getOrcDataSourceId(), "Value is not null but data stream is not present");
                 }
-                lengthStream.nextIntVector(nextBatchSize, lengthVector, nullVector);
+                lengthStream.nextIntVector(nextBatchSize, offsetVector, 0, nullVector);
             }
         }
 
@@ -128,9 +134,10 @@ public class MapStreamReader
         Type keyType = mapType.getKeyType();
         Type valueType = mapType.getValueType();
 
+        // Calculate the entryCount. Note that the values in the offsetVector are still length values now.
         int entryCount = 0;
-        for (int length : lengthVector) {
-            entryCount += length;
+        for (int i = 0; i < offsetVector.length - 1; i++) {
+            entryCount += offsetVector[i];
         }
 
         Block keys;
@@ -142,23 +149,25 @@ public class MapStreamReader
             values = valueStreamReader.readBlock(valueType);
         }
         else {
-            keys = keyType.createBlockBuilder(new BlockBuilderStatus(), 0).build();
-            values = valueType.createBlockBuilder(new BlockBuilderStatus(), 1).build();
+            keys = keyType.createBlockBuilder(null, 0).build();
+            values = valueType.createBlockBuilder(null, 1).build();
         }
 
-        Block[] keyValueBlock = createKeyValueBlock(nextBatchSize, keys, values, lengthVector);
+        Block[] keyValueBlock = createKeyValueBlock(nextBatchSize, keys, values, offsetVector);
 
-        // convert lengths into offsets into the keyValueBlock (e.g., two positions per entry)
-        int[] offsets = new int[nextBatchSize + 1];
-        for (int i = 1; i < offsets.length; i++) {
-            int length = lengthVector[i - 1];
-            offsets[i] = offsets[i - 1] + length;
+        // Convert the length values in the offsetVector to offset values in-place
+        int currentLength = offsetVector[0];
+        offsetVector[0] = 0;
+        for (int i = 1; i < offsetVector.length; i++) {
+            int lastLength = offsetVector[i];
+            offsetVector[i] = offsetVector[i - 1] + currentLength;
+            currentLength = lastLength;
         }
 
         readOffset = 0;
         nextBatchSize = 0;
 
-        return mapType.createBlockFromKeyValue(nullVector, offsets, keyValueBlock[0], keyValueBlock[1]);
+        return mapType.createBlockFromKeyValue(Optional.ofNullable(nullVector), offsetVector, keyValueBlock[0], keyValueBlock[1]);
     }
 
     private static Block[] createKeyValueBlock(int positionCount, Block keys, Block values, int[] lengths)
@@ -256,5 +265,23 @@ public class MapStreamReader
         return toStringHelper(this)
                 .addValue(streamDescriptor)
                 .toString();
+    }
+
+    @Override
+    public void close()
+    {
+        try (Closer closer = Closer.create()) {
+            closer.register(() -> keyStreamReader.close());
+            closer.register(() -> valueStreamReader.close());
+        }
+        catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    @Override
+    public long getRetainedSizeInBytes()
+    {
+        return INSTANCE_SIZE + keyStreamReader.getRetainedSizeInBytes() + valueStreamReader.getRetainedSizeInBytes();
     }
 }

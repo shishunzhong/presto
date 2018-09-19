@@ -27,6 +27,7 @@ import com.facebook.presto.tpcds.TpcdsColumnHandle;
 import com.teradata.tpcds.Table;
 import io.airlift.slice.Slices;
 
+import java.time.LocalDate;
 import java.util.Map;
 import java.util.Optional;
 
@@ -78,6 +79,7 @@ public class TpcdsTableStatisticsFactory
                         columnStatisticsData.getMax()
                                 .map(value -> toPrestoValue(value, type)))
                 .setDistinctValuesCount(new Estimate(columnStatisticsData.getDistinctValuesCount()))
+                .setDataSize(columnStatisticsData.getDataSize().map(Estimate::new).orElse(Estimate.unknownValue()))
                 .setFraction(new Estimate(((double) rowCount - nullCount) / rowCount))
                 .build());
 
@@ -91,6 +93,9 @@ public class TpcdsTableStatisticsFactory
         }
         else if (type instanceof CharType) {
             return truncateToLengthAndTrimSpaces(Slices.utf8Slice((String) tpcdsValue), type);
+        }
+        else if (tpcdsValue instanceof String && type.equals(DATE)) {
+            return LocalDate.parse((CharSequence) tpcdsValue).toEpochDay();
         }
         else if (type.equals(BIGINT) || type.equals(INTEGER) || type.equals(DATE) || (type instanceof DecimalType && isShortDecimal(type))) {
             return ((Number) tpcdsValue).longValue();

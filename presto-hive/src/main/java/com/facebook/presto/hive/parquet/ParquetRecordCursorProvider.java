@@ -13,8 +13,8 @@
  */
 package com.facebook.presto.hive.parquet;
 
+import com.facebook.presto.hive.FileFormatDataSourceStats;
 import com.facebook.presto.hive.HdfsEnvironment;
-import com.facebook.presto.hive.HiveClientConfig;
 import com.facebook.presto.hive.HiveColumnHandle;
 import com.facebook.presto.hive.HiveRecordCursorProvider;
 import com.facebook.presto.spi.ConnectorSession;
@@ -34,6 +34,7 @@ import java.util.Properties;
 import java.util.Set;
 
 import static com.facebook.presto.hive.HiveSessionProperties.isParquetPredicatePushdownEnabled;
+import static com.facebook.presto.hive.HiveSessionProperties.isUseParquetColumnNames;
 import static com.facebook.presto.hive.HiveUtil.getDeserializerClassName;
 import static java.util.Objects.requireNonNull;
 
@@ -45,19 +46,14 @@ public class ParquetRecordCursorProvider
             .add("parquet.hive.serde.ParquetHiveSerDe")
             .build();
 
-    private final boolean useParquetColumnNames;
     private final HdfsEnvironment hdfsEnvironment;
+    private final FileFormatDataSourceStats stats;
 
     @Inject
-    public ParquetRecordCursorProvider(HiveClientConfig hiveClientConfig, HdfsEnvironment hdfsEnvironment)
+    public ParquetRecordCursorProvider(HdfsEnvironment hdfsEnvironment, FileFormatDataSourceStats stats)
     {
-        this(requireNonNull(hiveClientConfig, "hiveClientConfig is null").isUseParquetColumnNames(), hdfsEnvironment);
-    }
-
-    public ParquetRecordCursorProvider(boolean useParquetColumnNames, HdfsEnvironment hdfsEnvironment)
-    {
-        this.useParquetColumnNames = useParquetColumnNames;
         this.hdfsEnvironment = requireNonNull(hdfsEnvironment, "hdfsEnvironment is null");
+        this.stats = requireNonNull(stats, "stats is null");
     }
 
     @Override
@@ -88,9 +84,10 @@ public class ParquetRecordCursorProvider
                 fileSize,
                 schema,
                 columns,
-                useParquetColumnNames,
+                isUseParquetColumnNames(session),
                 typeManager,
                 isParquetPredicatePushdownEnabled(session),
-                effectivePredicate));
+                effectivePredicate,
+                stats));
     }
 }

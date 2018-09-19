@@ -19,21 +19,27 @@ import com.facebook.presto.SystemSessionProperties;
 import com.facebook.presto.event.query.QueryMonitor;
 import com.facebook.presto.execution.QueryExecution.QueryExecutionFactory;
 import com.facebook.presto.execution.QueryExecution.QueryOutputInfo;
-import com.facebook.presto.execution.SqlQueryExecution.SqlQueryExecutionFactory;
 import com.facebook.presto.execution.StateMachine.StateChangeListener;
-import com.facebook.presto.execution.resourceGroups.QueryQueueFullException;
+import com.facebook.presto.execution.resourceGroups.ResourceGroupManager;
 import com.facebook.presto.execution.scheduler.NodeSchedulerConfig;
 import com.facebook.presto.memory.ClusterMemoryManager;
 import com.facebook.presto.metadata.InternalNodeManager;
 import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.metadata.SessionPropertyManager;
+import com.facebook.presto.server.BasicQueryInfo;
 import com.facebook.presto.server.SessionContext;
 import com.facebook.presto.server.SessionSupplier;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.QueryId;
+import com.facebook.presto.spi.resourceGroups.QueryType;
 import com.facebook.presto.spi.resourceGroups.ResourceGroupId;
+import com.facebook.presto.spi.resourceGroups.SelectionContext;
+import com.facebook.presto.spi.resourceGroups.SelectionCriteria;
+import com.facebook.presto.sql.SqlEnvironmentConfig;
+import com.facebook.presto.sql.SqlPath;
 import com.facebook.presto.sql.analyzer.SemanticException;
 import com.facebook.presto.sql.parser.ParsingException;
+import com.facebook.presto.sql.parser.ParsingOptions;
 import com.facebook.presto.sql.parser.SqlParser;
 import com.facebook.presto.sql.planner.Plan;
 import com.facebook.presto.sql.tree.Execute;
@@ -41,7 +47,9 @@ import com.facebook.presto.sql.tree.Explain;
 import com.facebook.presto.sql.tree.Expression;
 import com.facebook.presto.sql.tree.Statement;
 import com.facebook.presto.transaction.TransactionManager;
+import com.facebook.presto.util.StatementUtils;
 import com.google.common.collect.Ordering;
+import com.google.common.util.concurrent.AbstractFuture;
 import com.google.common.util.concurrent.ListenableFuture;
 import io.airlift.concurrent.ThreadPoolExecutorMBean;
 import io.airlift.log.Logger;
@@ -85,8 +93,9 @@ import static com.facebook.presto.spi.StandardErrorCode.QUERY_TEXT_TOO_LARGE;
 import static com.facebook.presto.spi.StandardErrorCode.SERVER_SHUTTING_DOWN;
 import static com.facebook.presto.spi.StandardErrorCode.SERVER_STARTING_UP;
 import static com.facebook.presto.sql.ParsingUtil.createParsingOptions;
+import static com.facebook.presto.sql.analyzer.ConstantExpressionVerifier.verifyExpressionIsConstant;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.INVALID_PARAMETER_USAGE;
-import static com.facebook.presto.sql.planner.ExpressionInterpreter.verifyExpressionIsConstant;
+import static com.facebook.presto.sql.parser.ParsingOptions.DecimalLiteralTreatment.AS_DECIMAL;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.util.concurrent.Futures.immediateFailedFuture;
@@ -108,9 +117,10 @@ public class SqlQueryManager
 
     private final ExecutorService queryExecutor;
     private final ThreadPoolExecutorMBean queryExecutorMBean;
-    private final QueryQueueManager queueManager;
+    private final ResourceGroupManager resourceGroupManager;
     private final ClusterMemoryManager memoryManager;
 
+    private final Optional<String> path;
     private final boolean isIncludeCoordinator;
     private final int maxQueryHistory;
     private final Duration minQueryExpireAge;
@@ -151,8 +161,9 @@ public class SqlQueryManager
             SqlParser sqlParser,
             NodeSchedulerConfig nodeSchedulerConfig,
             QueryManagerConfig queryManagerConfig,
+            SqlEnvironmentConfig sqlEnvironmentConfig,
             QueryMonitor queryMonitor,
-            QueryQueueManager queueManager,
+            ResourceGroupManager resourceGroupManager,
             ClusterMemoryManager memoryManager,
             LocationFactory locationFactory,
             TransactionManager transactionManager,
@@ -171,7 +182,7 @@ public class SqlQueryManager
 
         requireNonNull(nodeSchedulerConfig, "nodeSchedulerConfig is null");
         requireNonNull(queryManagerConfig, "queryManagerConfig is null");
-        this.queueManager = requireNonNull(queueManager, "queueManager is null");
+        this.resourceGroupManager = requireNonNull(resourceGroupManager, "resourceGroupManager is null");
         this.memoryManager = requireNonNull(memoryManager, "memoryManager is null");
 
         this.queryMonitor = requireNonNull(queryMonitor, "queryMonitor is null");
@@ -186,6 +197,7 @@ public class SqlQueryManager
 
         this.internalNodeManager = requireNonNull(internalNodeManager, "internalNodeManager is null");
 
+        this.path = sqlEnvironmentConfig.getPath();
         this.isIncludeCoordinator = nodeSchedulerConfig.isIncludeCoordinator();
         this.minQueryExpireAge = queryManagerConfig.getMinQueryExpireAge();
         this.maxQueryHistory = queryManagerConfig.getMaxQueryHistory();
@@ -279,12 +291,12 @@ public class SqlQueryManager
     }
 
     @Override
-    public List<QueryInfo> getAllQueryInfo()
+    public List<BasicQueryInfo> getQueries()
     {
         return queries.values().stream()
                 .map(queryExecution -> {
                     try {
-                        return queryExecution.getQueryInfo();
+                        return queryExecution.getBasicQueryInfo();
                     }
                     catch (RuntimeException ignored) {
                         return null;
@@ -299,7 +311,7 @@ public class SqlQueryManager
     {
         requireNonNull(listener, "listener is null");
 
-        getQuery(queryId).addOutputInfoListener(listener);
+        getQueryExecution(queryId).addOutputInfoListener(listener);
     }
 
     @Override
@@ -307,60 +319,86 @@ public class SqlQueryManager
     {
         requireNonNull(listener, "listener is null");
 
-        getQuery(queryId).addStateChangeListener(listener);
+        getQueryExecution(queryId).addStateChangeListener(listener);
     }
 
     @Override
     public ListenableFuture<QueryState> getStateChange(QueryId queryId, QueryState currentState)
     {
-        return tryGetQuery(queryId)
+        return tryGetQueryExecution(queryId)
                 .map(query -> query.getStateChange(currentState))
                 .orElseGet(() -> immediateFailedFuture(new NoSuchElementException()));
     }
 
     @Override
-    public QueryInfo getQueryInfo(QueryId queryId)
+    public BasicQueryInfo getQueryInfo(QueryId queryId)
     {
-        return getQuery(queryId).getQueryInfo();
+        return getQueryExecution(queryId).getBasicQueryInfo();
+    }
+
+    @Override
+    public QueryInfo getFullQueryInfo(QueryId queryId)
+    {
+        return getQueryExecution(queryId).getQueryInfo();
     }
 
     @Override
     public Optional<ResourceGroupId> getQueryResourceGroup(QueryId queryId)
     {
-        return tryGetQuery(queryId)
+        return tryGetQueryExecution(queryId)
                 .flatMap(QueryExecution::getResourceGroup);
     }
 
-    @Override
     public Plan getQueryPlan(QueryId queryId)
     {
-        return getQuery(queryId).getQueryPlan();
+        return getQueryExecution(queryId).getQueryPlan();
     }
 
     @Override
-    public Optional<QueryState> getQueryState(QueryId queryId)
+    public QueryState getQueryState(QueryId queryId)
     {
-        return tryGetQuery(queryId)
-                .map(QueryExecution::getState);
+        return getQueryExecution(queryId).getState();
     }
 
     @Override
     public void recordHeartbeat(QueryId queryId)
     {
-        tryGetQuery(queryId)
+        tryGetQueryExecution(queryId)
                 .ifPresent(QueryExecution::recordHeartbeat);
     }
 
     @Override
-    public QueryInfo createQuery(SessionContext sessionContext, String query)
+    public QueryId createQueryId()
     {
+        return queryIdGenerator.createNextQueryId();
+    }
+
+    @Override
+    public ListenableFuture<?> createQuery(QueryId queryId, SessionContext sessionContext, String query)
+    {
+        QueryCreationFuture queryCreationFuture = new QueryCreationFuture();
+        queryExecutor.submit(() -> {
+            try {
+                createQueryInternal(queryId, sessionContext, query);
+                queryCreationFuture.set(null);
+            }
+            catch (Throwable e) {
+                queryCreationFuture.setException(e);
+            }
+        });
+        return queryCreationFuture;
+    }
+
+    private void createQueryInternal(QueryId queryId, SessionContext sessionContext, String query)
+    {
+        requireNonNull(queryId, "queryId is null");
         requireNonNull(sessionContext, "sessionFactory is null");
         requireNonNull(query, "query is null");
         checkArgument(!query.isEmpty(), "query must not be empty string");
-
-        QueryId queryId = queryIdGenerator.createNextQueryId();
+        checkArgument(!queries.containsKey(queryId), "query %s already exists", queryId);
 
         Session session = null;
+        SelectionContext<?> selectionContext;
         QueryExecution queryExecution;
         Statement statement;
         try {
@@ -377,12 +415,22 @@ public class SqlQueryManager
                 acceptQueries.set(true);
             }
 
-            session = sessionSupplier.createSession(queryId, sessionContext);
             if (query.length() > maxQueryLength) {
                 int queryLength = query.length();
                 query = query.substring(0, maxQueryLength);
                 throw new PrestoException(QUERY_TEXT_TOO_LARGE, format("Query text length (%s) exceeds the maximum length (%s)", queryLength, maxQueryLength));
             }
+
+            Optional<String> queryType = getQueryType(query);
+            selectionContext = resourceGroupManager.selectGroup(new SelectionCriteria(
+                    sessionContext.getIdentity().getPrincipal().isPresent(),
+                    sessionContext.getIdentity().getUser(),
+                    Optional.ofNullable(sessionContext.getSource()),
+                    sessionContext.getClientTags(),
+                    sessionContext.getResourceEstimates(),
+                    queryType));
+
+            session = sessionSupplier.createSession(queryId, sessionContext, queryType, selectionContext.getResourceGroupId());
             Statement wrappedStatement = sqlParser.createStatement(query, createParsingOptions(session));
             statement = unwrapExecuteStatement(wrappedStatement, sqlParser, session);
             List<Expression> parameters = wrappedStatement instanceof Execute ? ((Execute) wrappedStatement).getParameters() : emptyList();
@@ -393,8 +441,9 @@ public class SqlQueryManager
             }
             if (statement instanceof Explain && ((Explain) statement).isAnalyze()) {
                 Statement innerStatement = ((Explain) statement).getStatement();
-                if (!(executionFactories.get(innerStatement.getClass()) instanceof SqlQueryExecutionFactory)) {
-                    throw new PrestoException(NOT_SUPPORTED, "EXPLAIN ANALYZE only supported for statements that are queries");
+                Optional<QueryType> innerQueryType = StatementUtils.getQueryType(innerStatement.getClass());
+                if (!innerQueryType.isPresent() || innerQueryType.get() == QueryType.DATA_DEFINITION) {
+                    throw new PrestoException(NOT_SUPPORTED, "EXPLAIN ANALYZE doesn't support statement type: " + innerStatement.getClass().getSimpleName());
                 }
             }
             queryExecution = queryExecutionFactory.createQueryExecution(queryId, query, session, statement, parameters);
@@ -409,21 +458,27 @@ public class SqlQueryManager
                 session = Session.builder(new SessionPropertyManager())
                         .setQueryId(queryId)
                         .setIdentity(sessionContext.getIdentity())
+                        .setPath(new SqlPath(Optional.empty()))
                         .build();
             }
-            Optional<ResourceGroupId> resourceGroup = Optional.empty();
-            if (e instanceof QueryQueueFullException) {
-                resourceGroup = Optional.of(((QueryQueueFullException) e).getResourceGroup());
-            }
-            QueryExecution execution = new FailedQueryExecution(queryId, query, resourceGroup, session, self, transactionManager, queryExecutor, metadata, e);
+            QueryExecution execution = new FailedQueryExecution(
+                    queryId,
+                    query,
+                    Optional.empty(),
+                    session,
+                    self,
+                    transactionManager,
+                    queryExecutor,
+                    metadata,
+                    e);
 
-            QueryInfo queryInfo = null;
             try {
-                queries.put(queryId, execution);
+                queries.putIfAbsent(queryId, execution);
 
-                queryInfo = execution.getQueryInfo();
+                QueryInfo queryInfo = execution.getQueryInfo();
                 queryMonitor.queryCreatedEvent(queryInfo);
                 queryMonitor.queryCompletedEvent(queryInfo);
+                stats.queryQueued();
                 stats.queryStarted();
                 stats.queryStopped();
                 stats.queryFinished(queryInfo);
@@ -433,7 +488,7 @@ public class SqlQueryManager
                 expirationQueue.add(execution);
             }
 
-            return queryInfo;
+            return;
         }
 
         QueryInfo queryInfo = queryExecution.getQueryInfo();
@@ -453,12 +508,19 @@ public class SqlQueryManager
 
         addStatsListeners(queryExecution);
 
-        queries.put(queryId, queryExecution);
+        if (queries.putIfAbsent(queryId, queryExecution) != null) {
+            // query already created, so just exit
+            return;
+        }
 
         // start the query in the background
-        queueManager.submit(statement, queryExecution, queryExecutor);
+        resourceGroupManager.submit(statement, queryExecution, selectionContext, queryExecutor);
+    }
 
-        return queryInfo;
+    private Optional<String> getQueryType(String query)
+    {
+        Statement statement = sqlParser.createStatement(query, new ParsingOptions(AS_DECIMAL));
+        return StatementUtils.getQueryType(statement.getClass()).map(Enum::name);
     }
 
     public static Statement unwrapExecuteStatement(Statement statement, SqlParser sqlParser, Session session)
@@ -487,7 +549,7 @@ public class SqlQueryManager
     {
         requireNonNull(cause, "cause is null");
 
-        tryGetQuery(queryId)
+        tryGetQueryExecution(queryId)
                 .ifPresent(query -> query.fail(cause));
     }
 
@@ -496,7 +558,7 @@ public class SqlQueryManager
     {
         log.debug("Cancel query %s", queryId);
 
-        tryGetQuery(queryId)
+        tryGetQueryExecution(queryId)
                 .ifPresent(QueryExecution::cancelQuery);
     }
 
@@ -507,7 +569,7 @@ public class SqlQueryManager
 
         log.debug("Cancel stage %s", stageId);
 
-        tryGetQuery(stageId.getQueryId())
+        tryGetQueryExecution(stageId.getQueryId())
                 .ifPresent(query -> query.cancelStage(stageId));
     }
 
@@ -538,9 +600,10 @@ public class SqlQueryManager
      */
     public void enforceMemoryLimits()
     {
-        memoryManager.process(queries.values().stream()
+        List<QueryExecution> runningQueries = queries.values().stream()
                 .filter(query -> query.getState() == RUNNING)
-                .collect(toImmutableList()));
+                .collect(toImmutableList());
+        memoryManager.process(runningQueries, this::getQueries);
     }
 
     /**
@@ -693,32 +756,38 @@ public class SqlQueryManager
         }
     }
 
-    /**
-     * Set up a callback to fire when a query is completed. The callback will be called at most once.
-     */
-    static void addCompletionCallback(QueryExecution queryExecution, Runnable callback)
+    private QueryExecution getQueryExecution(QueryId queryId)
     {
-        AtomicBoolean taskExecuted = new AtomicBoolean();
-        queryExecution.addStateChangeListener(newValue -> {
-            if (newValue.isDone() && taskExecuted.compareAndSet(false, true)) {
-                callback.run();
-            }
-        });
-        // Need to do this check in case the state changed before we added the previous state change listener
-        if (queryExecution.getState().isDone() && taskExecuted.compareAndSet(false, true)) {
-            callback.run();
-        }
-    }
-
-    private QueryExecution getQuery(QueryId queryId)
-    {
-        return tryGetQuery(queryId)
+        return tryGetQueryExecution(queryId)
                 .orElseThrow(NoSuchElementException::new);
     }
 
-    private Optional<QueryExecution> tryGetQuery(QueryId queryId)
+    private Optional<QueryExecution> tryGetQueryExecution(QueryId queryId)
     {
         requireNonNull(queryId, "queryId is null");
         return Optional.ofNullable(queries.get(queryId));
+    }
+
+    private static class QueryCreationFuture
+            extends AbstractFuture<QueryInfo>
+    {
+        @Override
+        protected boolean set(QueryInfo value)
+        {
+            return super.set(value);
+        }
+
+        @Override
+        protected boolean setException(Throwable throwable)
+        {
+            return super.setException(throwable);
+        }
+
+        @Override
+        public boolean cancel(boolean mayInterruptIfRunning)
+        {
+            // query submission can not be canceled
+            return false;
+        }
     }
 }

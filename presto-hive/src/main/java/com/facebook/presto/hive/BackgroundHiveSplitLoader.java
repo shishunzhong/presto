@@ -14,6 +14,8 @@
 package com.facebook.presto.hive;
 
 import com.facebook.presto.hive.HdfsEnvironment.HdfsContext;
+import com.facebook.presto.hive.HiveBucketing.HiveBucketFilter;
+import com.facebook.presto.hive.HiveSplit.BucketConversion;
 import com.facebook.presto.hive.metastore.Column;
 import com.facebook.presto.hive.metastore.Partition;
 import com.facebook.presto.hive.metastore.Table;
@@ -57,19 +59,21 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Optional;
 import java.util.Properties;
-import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.Executor;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.IntPredicate;
 
-import static com.facebook.presto.hive.HiveBucketing.HiveBucket;
 import static com.facebook.presto.hive.HiveErrorCode.HIVE_BAD_DATA;
+import static com.facebook.presto.hive.HiveErrorCode.HIVE_FILESYSTEM_ERROR;
 import static com.facebook.presto.hive.HiveErrorCode.HIVE_INVALID_BUCKET_FILES;
 import static com.facebook.presto.hive.HiveErrorCode.HIVE_INVALID_METADATA;
 import static com.facebook.presto.hive.HiveErrorCode.HIVE_INVALID_PARTITION_VALUE;
+import static com.facebook.presto.hive.HiveErrorCode.HIVE_UNKNOWN_ERROR;
 import static com.facebook.presto.hive.HiveSessionProperties.isForceLocalScheduling;
 import static com.facebook.presto.hive.HiveUtil.checkCondition;
+import static com.facebook.presto.hive.HiveUtil.getFooterCount;
+import static com.facebook.presto.hive.HiveUtil.getHeaderCount;
 import static com.facebook.presto.hive.HiveUtil.getInputFormat;
 import static com.facebook.presto.hive.metastore.MetastoreUtil.getHiveSchema;
 import static com.facebook.presto.hive.util.ConfigurationUtils.toJobConf;
@@ -77,8 +81,8 @@ import static com.facebook.presto.hive.util.HiveFileIterator.NestedDirectoryPoli
 import static com.facebook.presto.hive.util.HiveFileIterator.NestedDirectoryPolicy.IGNORED;
 import static com.facebook.presto.hive.util.HiveFileIterator.NestedDirectoryPolicy.RECURSE;
 import static com.facebook.presto.spi.StandardErrorCode.NOT_SUPPORTED;
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
-import static com.google.common.collect.ImmutableSet.toImmutableSet;
 import static com.google.common.util.concurrent.Futures.immediateFuture;
 import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
@@ -91,7 +95,7 @@ public class BackgroundHiveSplitLoader
 
     private final Table table;
     private final TupleDomain<? extends ColumnHandle> compactEffectivePredicate;
-    private final Optional<BucketSplitInfo> bucketSplitInfo;
+    private final Optional<BucketSplitInfo> tableBucketInfo;
     private final HdfsEnvironment hdfsEnvironment;
     private final HdfsContext hdfsContext;
     private final NamenodeStats namenodeStats;
@@ -127,7 +131,7 @@ public class BackgroundHiveSplitLoader
             Table table,
             Iterable<HivePartitionMetadata> partitions,
             TupleDomain<? extends ColumnHandle> compactEffectivePredicate,
-            Optional<BucketSplitInfo> bucketSplitInfo,
+            Optional<BucketSplitInfo> tableBucketInfo,
             ConnectorSession session,
             HdfsEnvironment hdfsEnvironment,
             NamenodeStats namenodeStats,
@@ -138,7 +142,7 @@ public class BackgroundHiveSplitLoader
     {
         this.table = table;
         this.compactEffectivePredicate = compactEffectivePredicate;
-        this.bucketSplitInfo = bucketSplitInfo;
+        this.tableBucketInfo = tableBucketInfo;
         this.loaderConcurrency = loaderConcurrency;
         this.session = session;
         this.hdfsEnvironment = hdfsEnvironment;
@@ -181,6 +185,12 @@ public class BackgroundHiveSplitLoader
                     future = loadSplits();
                 }
                 catch (Exception e) {
+                    if (e instanceof IOException) {
+                        e = new PrestoException(HIVE_FILESYSTEM_ERROR, e);
+                    }
+                    else if (!(e instanceof PrestoException)) {
+                        e = new PrestoException(HIVE_UNKNOWN_ERROR, e);
+                    }
                     // Fail the split source before releasing the execution lock
                     // Otherwise, a race could occur where the split source is completed before we fail it.
                     hiveSplitSource.fail(e);
@@ -272,7 +282,7 @@ public class BackgroundHiveSplitLoader
         FileSystem fs = hdfsEnvironment.getFileSystem(hdfsContext, path);
 
         if (inputFormat instanceof SymlinkTextInputFormat) {
-            if (bucketSplitInfo.isPresent()) {
+            if (tableBucketInfo.isPresent()) {
                 throw new PrestoException(NOT_SUPPORTED, "Bucketed table in SymlinkTextInputFormat is not yet supported");
             }
 
@@ -290,7 +300,7 @@ public class BackgroundHiveSplitLoader
                 FileInputFormat.setInputPaths(targetJob, targetPath);
                 InputSplit[] targetSplits = targetInputFormat.getSplits(targetJob, 0);
 
-                InternalHiveSplitFactory splitFactory = new InternalHiveSplitFactory(targetFilesystem, partitionName, inputFormat, schema, partitionKeys, effectivePredicate, partition.getColumnCoercions(), isForceLocalScheduling(session));
+                InternalHiveSplitFactory splitFactory = new InternalHiveSplitFactory(targetFilesystem, partitionName, inputFormat, schema, partitionKeys, effectivePredicate, partition.getColumnCoercions(), Optional.empty(), isForceLocalScheduling(session));
                 lastResult = addSplitsToSource(targetSplits, splitFactory);
                 if (stopped) {
                     return COMPLETED_FUTURE;
@@ -299,11 +309,40 @@ public class BackgroundHiveSplitLoader
             return lastResult;
         }
 
-        InternalHiveSplitFactory splitFactory = new InternalHiveSplitFactory(fs, partitionName, inputFormat, schema, partitionKeys, effectivePredicate, partition.getColumnCoercions(), isForceLocalScheduling(session));
+        Optional<BucketConversion> bucketConversion = Optional.empty();
+        boolean bucketConversionRequiresWorkerParticipation = false;
+        if (partition.getPartition().isPresent()) {
+            Optional<HiveBucketProperty> partitionBucketProperty = partition.getPartition().get().getStorage().getBucketProperty();
+            if (tableBucketInfo.isPresent() && partitionBucketProperty.isPresent()) {
+                int tableBucketCount = tableBucketInfo.get().getBucketCount();
+                int partitionBucketCount = partitionBucketProperty.get().getBucketCount();
+                // Validation was done in HiveSplitManager#getPartitionMetadata.
+                // Here, it's just trying to see if its needs the BucketConversion.
+                if (tableBucketCount != partitionBucketCount) {
+                    bucketConversion = Optional.of(new BucketConversion(tableBucketCount, partitionBucketCount, tableBucketInfo.get().getBucketColumns()));
+                    if (tableBucketCount > partitionBucketCount) {
+                        bucketConversionRequiresWorkerParticipation = true;
+                    }
+                }
+            }
+        }
+        InternalHiveSplitFactory splitFactory = new InternalHiveSplitFactory(
+                fs,
+                partitionName,
+                inputFormat,
+                schema,
+                partitionKeys,
+                effectivePredicate,
+                partition.getColumnCoercions(),
+                bucketConversionRequiresWorkerParticipation ? bucketConversion : Optional.empty(),
+                isForceLocalScheduling(session));
 
         // To support custom input formats, we want to call getSplits()
         // on the input format to obtain file splits.
         if (shouldUseFileSplitsFromInputFormat(inputFormat)) {
+            if (tableBucketInfo.isPresent()) {
+                throw new PrestoException(NOT_SUPPORTED, "Presto cannot read bucketed partition in an input format with UseFileSplitsFromInputFormat annotation: " + inputFormat.getClass().getSimpleName());
+            }
             JobConf jobConf = toJobConf(configuration);
             FileInputFormat.setInputPaths(jobConf, path);
             InputSplit[] splits = inputFormat.getSplits(jobConf, 0);
@@ -312,11 +351,12 @@ public class BackgroundHiveSplitLoader
         }
 
         // Bucketed partitions are fully loaded immediately since all files must be loaded to determine the file to bucket mapping
-        if (bucketSplitInfo.isPresent()) {
-            return hiveSplitSource.addToQueue(getBucketedSplits(path, fs, splitFactory, bucketSplitInfo.get()));
+        if (tableBucketInfo.isPresent()) {
+            return hiveSplitSource.addToQueue(getBucketedSplits(path, fs, splitFactory, tableBucketInfo.get(), bucketConversion));
         }
 
-        fileIterators.addLast(createInternalHiveSplitIterator(path, fs, splitFactory));
+        boolean splittable = getHeaderCount(schema) == 0 && getFooterCount(schema) == 0;
+        fileIterators.addLast(createInternalHiveSplitIterator(path, fs, splitFactory, splittable));
         return COMPLETED_FUTURE;
     }
 
@@ -344,21 +384,22 @@ public class BackgroundHiveSplitLoader
                 .anyMatch(name -> name.equals("UseFileSplitsFromInputFormat"));
     }
 
-    private Iterator<InternalHiveSplit> createInternalHiveSplitIterator(Path path, FileSystem fileSystem, InternalHiveSplitFactory splitFactory)
+    private Iterator<InternalHiveSplit> createInternalHiveSplitIterator(Path path, FileSystem fileSystem, InternalHiveSplitFactory splitFactory, boolean splittable)
     {
         return Streams.stream(new HiveFileIterator(path, fileSystem, directoryLister, namenodeStats, recursiveDirWalkerEnabled ? RECURSE : IGNORED))
-                .map(splitFactory::createInternalHiveSplit)
+                .map(status -> splitFactory.createInternalHiveSplit(status, splittable))
                 .filter(Optional::isPresent)
                 .map(Optional::get)
                 .iterator();
     }
 
-    private List<InternalHiveSplit> getBucketedSplits(Path path, FileSystem fileSystem, InternalHiveSplitFactory splitFactory, BucketSplitInfo bucketSplitInfo)
+    private List<InternalHiveSplit> getBucketedSplits(Path path, FileSystem fileSystem, InternalHiveSplitFactory splitFactory, BucketSplitInfo bucketSplitInfo, Optional<BucketConversion> bucketConversion)
     {
-        int bucketCount = bucketSplitInfo.getBucketCount();
+        int tableBucketCount = bucketSplitInfo.getBucketCount();
+        int partitionBucketCount = bucketConversion.isPresent() ? bucketConversion.get().getPartitionBucketCount() : tableBucketCount;
 
         // list all files in the partition
-        ArrayList<LocatedFileStatus> files = new ArrayList<>(bucketCount);
+        ArrayList<LocatedFileStatus> files = new ArrayList<>(partitionBucketCount);
         try {
             Iterators.addAll(files, new HiveFileIterator(path, fileSystem, directoryLister, namenodeStats, FAIL));
         }
@@ -372,13 +413,13 @@ public class BackgroundHiveSplitLoader
         }
 
         // verify we found one file per bucket
-        if (files.size() != bucketCount) {
+        if (files.size() != partitionBucketCount) {
             throw new PrestoException(
                     HIVE_INVALID_BUCKET_FILES,
                     format("Hive table '%s' is corrupt. The number of files in the directory (%s) does not match the declared bucket count (%s) for partition: %s",
                             new SchemaTableName(table.getDatabaseName(), table.getTableName()),
                             files.size(),
-                            bucketCount,
+                            partitionBucketCount,
                             splitFactory.getPartitionName()));
         }
 
@@ -387,10 +428,12 @@ public class BackgroundHiveSplitLoader
 
         // convert files internal splits
         List<InternalHiveSplit> splitList = new ArrayList<>();
-        for (int bucketNumber = 0; bucketNumber < bucketCount; bucketNumber++) {
-            if (bucketSplitInfo.isBucketEnabled(bucketNumber)) {
-                LocatedFileStatus file = files.get(bucketNumber);
-                splitFactory.createInternalHiveSplit(file, bucketNumber)
+        for (int bucketNumber = 0; bucketNumber < Math.max(tableBucketCount, partitionBucketCount); bucketNumber++) {
+            int partitionBucketNumber = bucketNumber % partitionBucketCount; // physical
+            int tableBucketNumber = bucketNumber % tableBucketCount; // logical
+            if (bucketSplitInfo.isBucketEnabled(tableBucketNumber)) {
+                LocatedFileStatus file = files.get(partitionBucketNumber);
+                splitFactory.createInternalHiveSplit(file, tableBucketNumber)
                         .ifPresent(splitList::add);
             }
         }
@@ -457,29 +500,38 @@ public class BackgroundHiveSplitLoader
 
     public static class BucketSplitInfo
     {
+        private final List<HiveColumnHandle> bucketColumns;
         private final int bucketCount;
         private final IntPredicate bucketFilter;
 
-        public static Optional<BucketSplitInfo> createBucketSplitInfo(Optional<HiveBucketHandle> bucketHandle, List<HiveBucket> buckets)
+        public static Optional<BucketSplitInfo> createBucketSplitInfo(Optional<HiveBucketHandle> bucketHandle, Optional<HiveBucketFilter> bucketFilter)
         {
             requireNonNull(bucketHandle, "bucketHandle is null");
-            requireNonNull(buckets, "buckets is null");
+            requireNonNull(bucketFilter, "buckets is null");
 
-            if (!buckets.isEmpty()) {
-                int bucketCount = buckets.get(0).getBucketCount();
-                Set<Integer> bucketNumbers = buckets.stream()
-                        .map(HiveBucket::getBucketNumber)
-                        .collect(toImmutableSet());
-                return Optional.of(new BucketSplitInfo(bucketCount, bucketNumbers::contains));
+            if (!bucketHandle.isPresent()) {
+                checkArgument(!bucketFilter.isPresent(), "bucketHandle must be present if bucketFilter is present");
+                return Optional.empty();
             }
 
-            return bucketHandle.map(handle -> new BucketSplitInfo(handle.getBucketCount(), bucketNumber -> true));
+            int bucketCount = bucketHandle.get().getBucketCount();
+            List<HiveColumnHandle> bucketColumns = bucketHandle.get().getColumns();
+            if (bucketFilter.isPresent()) {
+                return Optional.of(new BucketSplitInfo(bucketColumns, bucketCount, bucketFilter.get().getBucketsToKeep()::contains));
+            }
+            return Optional.of(new BucketSplitInfo(bucketColumns, bucketCount, bucketNumber -> true));
         }
 
-        private BucketSplitInfo(int bucketCount, IntPredicate bucketFilter)
+        private BucketSplitInfo(List<HiveColumnHandle> bucketColumns, int bucketCount, IntPredicate bucketFilter)
         {
-            this.bucketCount = requireNonNull(bucketCount, "bucketCount is null");
+            this.bucketColumns = ImmutableList.copyOf(requireNonNull(bucketColumns, "bucketColumns is null"));
+            this.bucketCount = bucketCount;
             this.bucketFilter = requireNonNull(bucketFilter, "bucketFilter is null");
+        }
+
+        public List<HiveColumnHandle> getBucketColumns()
+        {
+            return bucketColumns;
         }
 
         public int getBucketCount()

@@ -23,9 +23,11 @@ import java.lang.invoke.MethodHandle;
 import java.util.function.BiConsumer;
 
 import static com.facebook.presto.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
+import static com.facebook.presto.spi.StandardErrorCode.NOT_SUPPORTED;
 import static com.facebook.presto.spi.block.AbstractMapBlock.HASH_MULTIPLIER;
 import static io.airlift.slice.SizeOf.sizeOf;
 import static io.airlift.slice.SizeOf.sizeOfIntArray;
+import static java.lang.String.format;
 
 public class SingleMapBlock
         extends AbstractSingleMapBlock
@@ -37,7 +39,7 @@ public class SingleMapBlock
     private final Block keyBlock;
     private final Block valueBlock;
     private final int[] hashTable;
-    private final Type keyType;
+    final Type keyType;
     private final MethodHandle keyNativeHashCode;
     private final MethodHandle keyBlockNativeEquals;
 
@@ -83,9 +85,9 @@ public class SingleMapBlock
     }
 
     @Override
-    public BlockEncoding getEncoding()
+    public String getEncodingName()
     {
-        return new SingleMapBlockEncoding(keyType, keyNativeHashCode, keyBlockNativeEquals, keyBlock.getEncoding(), valueBlock.getEncoding());
+        return SingleMapBlockEncoding.NAME;
     }
 
     @Override
@@ -95,15 +97,44 @@ public class SingleMapBlock
     }
 
     @Override
-    Block getKeyBlock()
+    Block getRawKeyBlock()
     {
         return keyBlock;
     }
 
     @Override
-    Block getValueBlock()
+    Block getRawValueBlock()
     {
         return valueBlock;
+    }
+
+    @Override
+    public String toString()
+    {
+        return format("SingleMapBlock{positionCount=%d}", getPositionCount());
+    }
+
+    @Override
+    public Block getLoadedBlock()
+    {
+        if (keyBlock != keyBlock.getLoadedBlock()) {
+            // keyBlock has to be loaded since MapBlock constructs hash table eagerly.
+            throw new IllegalStateException();
+        }
+
+        Block loadedValueBlock = valueBlock.getLoadedBlock();
+        if (loadedValueBlock == valueBlock) {
+            return this;
+        }
+        return new SingleMapBlock(
+                offset,
+                positionCount,
+                keyBlock,
+                loadedValueBlock,
+                hashTable,
+                keyType,
+                keyNativeHashCode,
+                keyBlockNativeEquals);
     }
 
     int[] getHashTable()
@@ -111,6 +142,9 @@ public class SingleMapBlock
         return hashTable;
     }
 
+    /**
+     * @return position of the value under {@code nativeValue} key. -1 when key is not found.
+     */
     public int seekKey(Object nativeValue)
     {
         if (positionCount == 0) {
@@ -133,13 +167,15 @@ public class SingleMapBlock
             if (keyPosition == -1) {
                 return -1;
             }
-            boolean match;
+            Boolean match;
             try {
-                match = (boolean) keyBlockNativeEquals.invoke(keyBlock, offset / 2 + keyPosition, nativeValue);
+                // assuming maps with indeterminate keys are not supported
+                match = (Boolean) keyBlockNativeEquals.invoke(keyBlock, offset / 2 + keyPosition, nativeValue);
             }
             catch (Throwable throwable) {
                 throw handleThrowable(throwable);
             }
+            checkNotIndeterminate(match);
             if (match) {
                 return keyPosition * 2 + 1;
             }
@@ -175,13 +211,15 @@ public class SingleMapBlock
             if (keyPosition == -1) {
                 return -1;
             }
-            boolean match;
+            Boolean match;
             try {
-                match = (boolean) keyBlockNativeEquals.invokeExact(keyBlock, offset / 2 + keyPosition, nativeValue);
+                // assuming maps with indeterminate keys are not supported
+                match = (Boolean) keyBlockNativeEquals.invokeExact(keyBlock, offset / 2 + keyPosition, nativeValue);
             }
             catch (Throwable throwable) {
                 throw handleThrowable(throwable);
             }
+            checkNotIndeterminate(match);
             if (match) {
                 return keyPosition * 2 + 1;
             }
@@ -214,13 +252,15 @@ public class SingleMapBlock
             if (keyPosition == -1) {
                 return -1;
             }
-            boolean match;
+            Boolean match;
             try {
-                match = (boolean) keyBlockNativeEquals.invokeExact(keyBlock, offset / 2 + keyPosition, nativeValue);
+                // assuming maps with indeterminate keys are not supported
+                match = (Boolean) keyBlockNativeEquals.invokeExact(keyBlock, offset / 2 + keyPosition, nativeValue);
             }
             catch (Throwable throwable) {
                 throw handleThrowable(throwable);
             }
+            checkNotIndeterminate(match);
             if (match) {
                 return keyPosition * 2 + 1;
             }
@@ -253,13 +293,15 @@ public class SingleMapBlock
             if (keyPosition == -1) {
                 return -1;
             }
-            boolean match;
+            Boolean match;
             try {
-                match = (boolean) keyBlockNativeEquals.invokeExact(keyBlock, offset / 2 + keyPosition, nativeValue);
+                // assuming maps with indeterminate keys are not supported
+                match = (Boolean) keyBlockNativeEquals.invokeExact(keyBlock, offset / 2 + keyPosition, nativeValue);
             }
             catch (Throwable throwable) {
                 throw handleThrowable(throwable);
             }
+            checkNotIndeterminate(match);
             if (match) {
                 return keyPosition * 2 + 1;
             }
@@ -292,13 +334,15 @@ public class SingleMapBlock
             if (keyPosition == -1) {
                 return -1;
             }
-            boolean match;
+            Boolean match;
             try {
-                match = (boolean) keyBlockNativeEquals.invokeExact(keyBlock, offset / 2 + keyPosition, nativeValue);
+                // assuming maps with indeterminate keys are not supported
+                match = (Boolean) keyBlockNativeEquals.invokeExact(keyBlock, offset / 2 + keyPosition, nativeValue);
             }
             catch (Throwable throwable) {
                 throw handleThrowable(throwable);
             }
+            checkNotIndeterminate(match);
             if (match) {
                 return keyPosition * 2 + 1;
             }
@@ -331,13 +375,15 @@ public class SingleMapBlock
             if (keyPosition == -1) {
                 return -1;
             }
-            boolean match;
+            Boolean match;
             try {
-                match = (boolean) keyBlockNativeEquals.invokeExact(keyBlock, offset / 2 + keyPosition, nativeValue);
+                // assuming maps with indeterminate keys are not supported
+                match = (Boolean) keyBlockNativeEquals.invokeExact(keyBlock, offset / 2 + keyPosition, nativeValue);
             }
             catch (Throwable throwable) {
                 throw handleThrowable(throwable);
             }
+            checkNotIndeterminate(match);
             if (match) {
                 return keyPosition * 2 + 1;
             }
@@ -357,5 +403,12 @@ public class SingleMapBlock
             throw (PrestoException) throwable;
         }
         throw new PrestoException(GENERIC_INTERNAL_ERROR, throwable);
+    }
+
+    private static void checkNotIndeterminate(Boolean equalsResult)
+    {
+        if (equalsResult == null) {
+            throw new PrestoException(NOT_SUPPORTED, "map key cannot be null or contain nulls");
+        }
     }
 }

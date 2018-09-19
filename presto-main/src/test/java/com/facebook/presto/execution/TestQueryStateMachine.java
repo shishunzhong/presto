@@ -51,10 +51,11 @@ import static com.facebook.presto.execution.QueryState.PLANNING;
 import static com.facebook.presto.execution.QueryState.QUEUED;
 import static com.facebook.presto.execution.QueryState.RUNNING;
 import static com.facebook.presto.execution.QueryState.STARTING;
+import static com.facebook.presto.execution.QueryState.WAITING_FOR_RESOURCES;
 import static com.facebook.presto.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
 import static com.facebook.presto.spi.StandardErrorCode.USER_CANCELED;
 import static com.facebook.presto.spi.type.BigintType.BIGINT;
-import static com.facebook.presto.transaction.TransactionManager.createTestTransactionManager;
+import static com.facebook.presto.transaction.InMemoryTransactionManager.createTestTransactionManager;
 import static io.airlift.concurrent.MoreFutures.tryGetFutureValue;
 import static java.util.concurrent.Executors.newCachedThreadPool;
 import static org.testng.Assert.assertEquals;
@@ -95,6 +96,29 @@ public class TestQueryStateMachine
     {
         QueryStateMachine stateMachine = createQueryStateMachine();
         assertState(stateMachine, QUEUED);
+
+        assertTrue(stateMachine.transitionToPlanning());
+        assertState(stateMachine, PLANNING);
+
+        assertTrue(stateMachine.transitionToStarting());
+        assertState(stateMachine, STARTING);
+
+        assertTrue(stateMachine.transitionToRunning());
+        assertState(stateMachine, RUNNING);
+
+        assertTrue(stateMachine.transitionToFinishing());
+        tryGetFutureValue(stateMachine.getStateChange(FINISHING), 2, TimeUnit.SECONDS);
+        assertState(stateMachine, FINISHED);
+    }
+
+    @Test
+    public void testStateChangesWithResourceWaiting()
+    {
+        QueryStateMachine stateMachine = createQueryStateMachine();
+        assertState(stateMachine, QUEUED);
+
+        assertTrue(stateMachine.transitionToWaitingForResources());
+        assertState(stateMachine, WAITING_FOR_RESOURCES);
 
         assertTrue(stateMachine.transitionToPlanning());
         assertState(stateMachine, PLANNING);
@@ -275,6 +299,32 @@ public class TestQueryStateMachine
         assertTrue(queryStats.getTotalPlanningTime().toMillis() == 500);
     }
 
+    @Test
+    public void testUpdateMemoryUsage()
+    {
+        QueryStateMachine stateMachine = createQueryStateMachine();
+
+        stateMachine.updateMemoryUsage(5, 10, 3);
+        assertEquals(stateMachine.getPeakUserMemoryInBytes(), 5);
+        assertEquals(stateMachine.getPeakTotalMemoryInBytes(), 10);
+        assertEquals(stateMachine.getPeakTaskTotalMemory(), 3);
+
+        stateMachine.updateMemoryUsage(0, 0, 2);
+        assertEquals(stateMachine.getPeakUserMemoryInBytes(), 5);
+        assertEquals(stateMachine.getPeakTotalMemoryInBytes(), 10);
+        assertEquals(stateMachine.getPeakTaskTotalMemory(), 3);
+
+        stateMachine.updateMemoryUsage(1, 1, 5);
+        assertEquals(stateMachine.getPeakUserMemoryInBytes(), 6);
+        assertEquals(stateMachine.getPeakTotalMemoryInBytes(), 11);
+        assertEquals(stateMachine.getPeakTaskTotalMemory(), 5);
+
+        stateMachine.updateMemoryUsage(3, 3, 2);
+        assertEquals(stateMachine.getPeakUserMemoryInBytes(), 9);
+        assertEquals(stateMachine.getPeakTotalMemoryInBytes(), 14);
+        assertEquals(stateMachine.getPeakTaskTotalMemory(), 5);
+    }
+
     private static void assertFinalState(QueryStateMachine stateMachine, QueryState expectedState)
     {
         assertFinalState(stateMachine, expectedState, null);
@@ -336,8 +386,17 @@ public class TestQueryStateMachine
             assertNull(queryStats.getFinishingTime());
             assertNull(queryStats.getEndTime());
         }
+        else if (queryInfo.getState() == WAITING_FOR_RESOURCES) {
+            assertNotNull(queryStats.getQueuedTime());
+            assertNull(queryStats.getResourceWaitingTime());
+            assertNull(queryStats.getTotalPlanningTime());
+            assertNull(queryStats.getExecutionStartTime());
+            assertNull(queryStats.getFinishingTime());
+            assertNull(queryStats.getEndTime());
+        }
         else if (queryInfo.getState() == PLANNING) {
             assertNotNull(queryStats.getQueuedTime());
+            assertNotNull(queryStats.getResourceWaitingTime());
             assertNull(queryStats.getTotalPlanningTime());
             assertNull(queryStats.getExecutionStartTime());
             assertNull(queryStats.getFinishingTime());
@@ -345,6 +404,7 @@ public class TestQueryStateMachine
         }
         else if (queryInfo.getState() == STARTING) {
             assertNotNull(queryStats.getQueuedTime());
+            assertNotNull(queryStats.getResourceWaitingTime());
             assertNotNull(queryStats.getTotalPlanningTime());
             assertNull(queryStats.getExecutionStartTime());
             assertNull(queryStats.getFinishingTime());
@@ -352,6 +412,7 @@ public class TestQueryStateMachine
         }
         else if (queryInfo.getState() == RUNNING) {
             assertNotNull(queryStats.getQueuedTime());
+            assertNotNull(queryStats.getResourceWaitingTime());
             assertNotNull(queryStats.getTotalPlanningTime());
             assertNotNull(queryStats.getExecutionStartTime());
             assertNull(queryStats.getFinishingTime());
@@ -359,6 +420,7 @@ public class TestQueryStateMachine
         }
         else if (queryInfo.getState() == FINISHING) {
             assertNotNull(queryStats.getQueuedTime());
+            assertNotNull(queryStats.getResourceWaitingTime());
             assertNotNull(queryStats.getTotalPlanningTime());
             assertNotNull(queryStats.getExecutionStartTime());
             assertNull(queryStats.getFinishingTime());
@@ -366,6 +428,7 @@ public class TestQueryStateMachine
         }
         else {
             assertNotNull(queryStats.getQueuedTime());
+            assertNotNull(queryStats.getResourceWaitingTime());
             assertNotNull(queryStats.getTotalPlanningTime());
             assertNotNull(queryStats.getExecutionStartTime());
             assertNotNull(queryStats.getFinishingTime());
@@ -377,7 +440,7 @@ public class TestQueryStateMachine
         assertEquals(stateMachine.isDone(), expectedState.isDone());
 
         if (expectedState == FAILED) {
-            FailureInfo failure = queryInfo.getFailureInfo();
+            FailureInfo failure = queryInfo.getFailureInfo().toFailureInfo();
             assertNotNull(failure);
             assertEquals(failure.getType(), expectedException.getClass().getName());
             if (expectedException instanceof PrestoException) {

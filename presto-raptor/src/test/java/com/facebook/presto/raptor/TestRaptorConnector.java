@@ -216,7 +216,9 @@ public class TestRaptorConnector
     {
         ConnectorSession session = new TestingConnectorSession(
                 "user",
+                "path",
                 Optional.of("test"),
+                Optional.empty(),
                 getTimeZoneKey(userTimeZone),
                 ENGLISH,
                 System.currentTimeMillis(),

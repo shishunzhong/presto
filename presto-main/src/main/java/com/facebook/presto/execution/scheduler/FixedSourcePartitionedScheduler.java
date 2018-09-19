@@ -18,30 +18,40 @@ import com.facebook.presto.execution.RemoteTask;
 import com.facebook.presto.execution.SqlStageExecution;
 import com.facebook.presto.execution.scheduler.ScheduleResult.BlockedReason;
 import com.facebook.presto.metadata.Split;
-import com.facebook.presto.operator.PipelineExecutionStrategy;
+import com.facebook.presto.operator.StageExecutionStrategy;
 import com.facebook.presto.spi.Node;
 import com.facebook.presto.spi.connector.ConnectorPartitionHandle;
 import com.facebook.presto.split.SplitSource;
 import com.facebook.presto.sql.planner.NodePartitionMap;
 import com.facebook.presto.sql.planner.plan.PlanNodeId;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.util.concurrent.ListenableFuture;
+import com.google.common.util.concurrent.SettableFuture;
 import io.airlift.log.Logger;
+import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
+import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.ints.IntArrayList;
+import it.unimi.dsi.fastutil.ints.IntList;
+import it.unimi.dsi.fastutil.ints.IntListIterator;
+
+import javax.annotation.concurrent.GuardedBy;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
-import static com.facebook.presto.execution.scheduler.SourcePartitionedScheduler.managedSourcePartitionedScheduler;
-import static com.facebook.presto.operator.PipelineExecutionStrategy.UNGROUPED_EXECUTION;
+import static com.facebook.presto.execution.scheduler.SourcePartitionedScheduler.newSourcePartitionedSchedulerAsSourceScheduler;
 import static com.facebook.presto.spi.connector.NotPartitionedPartitionHandle.NOT_PARTITIONED;
 import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.base.Verify.verify;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static io.airlift.concurrent.MoreFutures.whenAnyComplete;
@@ -54,14 +64,15 @@ public class FixedSourcePartitionedScheduler
 
     private final SqlStageExecution stage;
     private final NodePartitionMap partitioning;
-    private final List<SourcePartitionedScheduler> sourcePartitionedSchedulers;
+    private final List<SourceScheduler> sourceSchedulers;
     private final List<ConnectorPartitionHandle> partitionHandles;
     private boolean scheduledTasks;
+    private final Optional<LifespanScheduler> groupedLifespanScheduler;
 
     public FixedSourcePartitionedScheduler(
             SqlStageExecution stage,
             Map<PlanNodeId, SplitSource> splitSources,
-            PipelineExecutionStrategy pipelineExecutionStrategy,
+            StageExecutionStrategy stageExecutionStrategy,
             List<PlanNodeId> schedulingOrder,
             NodePartitionMap partitioning,
             int splitBatchSize,
@@ -82,10 +93,10 @@ public class FixedSourcePartitionedScheduler
 
         FixedSplitPlacementPolicy splitPlacementPolicy = new FixedSplitPlacementPolicy(nodeSelector, partitioning, stage::getAllTasks);
 
-        ArrayList<SourcePartitionedScheduler> sourcePartitionedSchedulers = new ArrayList<>();
+        ArrayList<SourceScheduler> sourceSchedulers = new ArrayList<>();
         checkArgument(
-                partitionHandles.equals(ImmutableList.of(NOT_PARTITIONED)) == (pipelineExecutionStrategy == UNGROUPED_EXECUTION),
-                "PartitionHandles should be [NOT_PARTITIONED] if and only if the execution strategy is UNGROUPED_EXECUTION");
+                partitionHandles.equals(ImmutableList.of(NOT_PARTITIONED)) != stageExecutionStrategy.isAnyScanGroupedExecution(),
+                "PartitionHandles should be [NOT_PARTITIONED] if and only if all scan nodes use ungrouped execution strategy");
         int effectiveConcurrentLifespans;
         if (!concurrentLifespans.isPresent() || concurrentLifespans.getAsInt() > partitionHandles.size()) {
             effectiveConcurrentLifespans = partitionHandles.size();
@@ -95,51 +106,38 @@ public class FixedSourcePartitionedScheduler
         }
 
         boolean firstPlanNode = true;
+        Optional<LifespanScheduler> groupedLifespanScheduler = Optional.empty();
         for (PlanNodeId planNodeId : schedulingOrder) {
             SplitSource splitSource = splitSources.get(planNodeId);
-            SourcePartitionedScheduler sourcePartitionedScheduler = managedSourcePartitionedScheduler(
+            SourceScheduler sourceScheduler = newSourcePartitionedSchedulerAsSourceScheduler(
                     stage,
                     planNodeId,
                     splitSource,
                     splitPlacementPolicy,
                     Math.max(splitBatchSize / effectiveConcurrentLifespans, 1));
-            sourcePartitionedSchedulers.add(sourcePartitionedScheduler);
+
+            if (stageExecutionStrategy.isAnyScanGroupedExecution() && !stageExecutionStrategy.isGroupedExecution(planNodeId)) {
+                sourceScheduler = new AsGroupedSourceScheduler(sourceScheduler);
+            }
+            sourceSchedulers.add(sourceScheduler);
 
             if (firstPlanNode) {
                 firstPlanNode = false;
-                switch (pipelineExecutionStrategy) {
-                    case UNGROUPED_EXECUTION:
-                        sourcePartitionedScheduler.startLifespan(Lifespan.taskWide(), NOT_PARTITIONED);
-                        break;
-                    case GROUPED_EXECUTION:
-                        AtomicInteger nextDriverGroupIndex = new AtomicInteger();
-                        stage.addCompletedDriverGroupsChangedListener(newlyCompletedDriverGroups -> {
-                            // Schedule a new lifespan for each finished one
-                            for (Lifespan ignored : newlyCompletedDriverGroups) {
-                                scheduleNextDriverGroup(sourcePartitionedScheduler, nextDriverGroupIndex);
-                            }
-                        });
-                        // Schedule the first few lifespans
-                        for (int i = 0; i < effectiveConcurrentLifespans; i++) {
-                            scheduleNextDriverGroup(sourcePartitionedScheduler, nextDriverGroupIndex);
-                        }
-                        break;
-                    default:
-                        throw new IllegalArgumentException("Unknown pipelineExecutionStrategy");
+                if (!stageExecutionStrategy.isAnyScanGroupedExecution()) {
+                    sourceScheduler.startLifespan(Lifespan.taskWide(), NOT_PARTITIONED);
+                }
+                else {
+                    LifespanScheduler lifespanScheduler = new LifespanScheduler(partitioning, partitionHandles);
+                    // Schedule the first few lifespans
+                    lifespanScheduler.scheduleInitial(sourceScheduler);
+                    // Schedule new lifespans for finished ones
+                    stage.addCompletedDriverGroupsChangedListener(lifespanScheduler::onLifespanFinished);
+                    groupedLifespanScheduler = Optional.of(lifespanScheduler);
                 }
             }
         }
-        this.sourcePartitionedSchedulers = sourcePartitionedSchedulers;
-    }
-
-    private void scheduleNextDriverGroup(SourcePartitionedScheduler scheduler, AtomicInteger nextDriverGroupIndex)
-    {
-        int driverGroupIndex = nextDriverGroupIndex.getAndIncrement();
-        if (driverGroupIndex >= partitionHandles.size()) {
-            return;
-        }
-        Lifespan lifespan = Lifespan.driverGroup(driverGroupIndex);
-        scheduler.startLifespan(lifespan, partitionHandleFor(lifespan));
+        this.groupedLifespanScheduler = groupedLifespanScheduler;
+        this.sourceSchedulers = sourceSchedulers;
     }
 
     private ConnectorPartitionHandle partitionHandleFor(Lifespan lifespan)
@@ -156,8 +154,9 @@ public class FixedSourcePartitionedScheduler
         // schedule a task on every node in the distribution
         List<RemoteTask> newTasks = ImmutableList.of();
         if (!scheduledTasks) {
+            OptionalInt totalPartitions = OptionalInt.of(partitioning.getPartitionToNode().size());
             newTasks = partitioning.getPartitionToNode().entrySet().stream()
-                    .map(entry -> stage.scheduleTask(entry.getValue(), entry.getKey()))
+                    .map(entry -> stage.scheduleTask(entry.getValue(), entry.getKey(), totalPartitions))
                     .collect(toImmutableList());
             scheduledTasks = true;
         }
@@ -165,18 +164,27 @@ public class FixedSourcePartitionedScheduler
         boolean allBlocked = true;
         List<ListenableFuture<?>> blocked = new ArrayList<>();
         BlockedReason blockedReason = BlockedReason.NO_ACTIVE_DRIVER_GROUP;
-        int splitsScheduled = 0;
 
-        Iterator<SourcePartitionedScheduler> schedulerIterator = sourcePartitionedSchedulers.iterator();
+        if (groupedLifespanScheduler.isPresent()) {
+            // Start new driver groups on the first scheduler if necessary,
+            // i.e. when previous ones have finished execution (not finished scheduling).
+            //
+            // Invoke schedule method to get a new SettableFuture every time.
+            // Reusing previously returned SettableFuture could lead to the ListenableFuture retaining too many listeners.
+            blocked.add(groupedLifespanScheduler.get().schedule(sourceSchedulers.get(0)));
+        }
+
+        int splitsScheduled = 0;
+        Iterator<SourceScheduler> schedulerIterator = sourceSchedulers.iterator();
         List<Lifespan> driverGroupsToStart = ImmutableList.of();
         while (schedulerIterator.hasNext()) {
-            SourcePartitionedScheduler sourcePartitionedScheduler = schedulerIterator.next();
+            SourceScheduler sourceScheduler = schedulerIterator.next();
 
             for (Lifespan lifespan : driverGroupsToStart) {
-                sourcePartitionedScheduler.startLifespan(lifespan, partitionHandleFor(lifespan));
+                sourceScheduler.startLifespan(lifespan, partitionHandleFor(lifespan));
             }
 
-            ScheduleResult schedule = sourcePartitionedScheduler.schedule();
+            ScheduleResult schedule = sourceScheduler.schedule();
             splitsScheduled += schedule.getSplitsScheduled();
             if (schedule.getBlockedReason().isPresent()) {
                 blocked.add(schedule.getBlocked());
@@ -187,34 +195,35 @@ public class FixedSourcePartitionedScheduler
                 allBlocked = false;
             }
 
-            driverGroupsToStart = sourcePartitionedScheduler.drainCompletedLifespans();
+            driverGroupsToStart = sourceScheduler.drainCompletedLifespans();
 
             if (schedule.isFinished()) {
+                stage.schedulingComplete(sourceScheduler.getPlanNodeId());
                 schedulerIterator.remove();
-                sourcePartitionedScheduler.close();
+                sourceScheduler.close();
             }
         }
 
         if (allBlocked) {
-            return new ScheduleResult(sourcePartitionedSchedulers.isEmpty(), newTasks, whenAnyComplete(blocked), blockedReason, splitsScheduled);
+            return new ScheduleResult(sourceSchedulers.isEmpty(), newTasks, whenAnyComplete(blocked), blockedReason, splitsScheduled);
         }
         else {
-            return new ScheduleResult(sourcePartitionedSchedulers.isEmpty(), newTasks, splitsScheduled);
+            return new ScheduleResult(sourceSchedulers.isEmpty(), newTasks, splitsScheduled);
         }
     }
 
     @Override
     public void close()
     {
-        for (SourcePartitionedScheduler sourcePartitionedScheduler : sourcePartitionedSchedulers) {
+        for (SourceScheduler sourceScheduler : sourceSchedulers) {
             try {
-                sourcePartitionedScheduler.close();
+                sourceScheduler.close();
             }
             catch (Throwable t) {
                 log.warn(t, "Error closing split source");
             }
         }
-        sourcePartitionedSchedulers.clear();
+        sourceSchedulers.clear();
     }
 
     public static class FixedSplitPlacementPolicy
@@ -253,6 +262,147 @@ public class FixedSourcePartitionedScheduler
         public Node getNodeForBucket(int bucketId)
         {
             return partitioning.getPartitionToNode().get(partitioning.getBucketToPartition()[bucketId]);
+        }
+    }
+
+    private static class LifespanScheduler
+    {
+        private final Int2ObjectMap<Node> driverGroupToNodeMap;
+        private final Map<Node, IntListIterator> nodeToDriverGroupsMap;
+        private final List<ConnectorPartitionHandle> partitionHandles;
+
+        private boolean initialScheduled;
+        private SettableFuture<?> newDriverGroupReady = SettableFuture.create();
+        @GuardedBy("this")
+        private final List<Lifespan> recentlyCompletedDriverGroups = new ArrayList<>();
+
+        public LifespanScheduler(NodePartitionMap nodePartitionMap, List<ConnectorPartitionHandle> partitionHandles)
+        {
+            Map<Node, IntList> nodeToDriverGroupMap = new HashMap<>();
+            Int2ObjectMap<Node> driverGroupToNodeMap = new Int2ObjectOpenHashMap<>();
+            int[] bucketToPartition = nodePartitionMap.getBucketToPartition();
+            Map<Integer, Node> partitionToNode = nodePartitionMap.getPartitionToNode();
+            for (int bucket = 0; bucket < bucketToPartition.length; bucket++) {
+                int partition = bucketToPartition[bucket];
+                Node node = partitionToNode.get(partition);
+                nodeToDriverGroupMap.computeIfAbsent(node, key -> new IntArrayList()).add(bucket);
+                driverGroupToNodeMap.put(bucket, node);
+            }
+
+            this.driverGroupToNodeMap = driverGroupToNodeMap;
+            this.nodeToDriverGroupsMap = nodeToDriverGroupMap.entrySet().stream()
+                    .collect(ImmutableMap.toImmutableMap(Map.Entry::getKey, entry -> entry.getValue().iterator()));
+            this.partitionHandles = requireNonNull(partitionHandles, "partitionHandles is null");
+        }
+
+        public void scheduleInitial(SourceScheduler scheduler)
+        {
+            checkState(!initialScheduled);
+            initialScheduled = true;
+
+            for (Map.Entry<Node, IntListIterator> entry : nodeToDriverGroupsMap.entrySet()) {
+                int driverGroupId = entry.getValue().nextInt();
+                scheduler.startLifespan(Lifespan.driverGroup(driverGroupId), partitionHandles.get(driverGroupId));
+            }
+        }
+
+        public void onLifespanFinished(Iterable<Lifespan> newlyCompletedDriverGroups)
+        {
+            checkState(initialScheduled);
+
+            synchronized (this) {
+                for (Lifespan newlyCompletedDriverGroup : newlyCompletedDriverGroups) {
+                    checkArgument(!newlyCompletedDriverGroup.isTaskWide());
+                    recentlyCompletedDriverGroups.add(newlyCompletedDriverGroup);
+                }
+                newDriverGroupReady.set(null);
+            }
+        }
+
+        public SettableFuture schedule(SourceScheduler scheduler)
+        {
+            // Return a new future even if newDriverGroupReady has not finished.
+            // Returning the same SettableFuture instance could lead to ListenableFuture retaining too many listener objects.
+
+            checkState(initialScheduled);
+
+            List<Lifespan> recentlyCompletedDriverGroups;
+            synchronized (this) {
+                recentlyCompletedDriverGroups = ImmutableList.copyOf(this.recentlyCompletedDriverGroups);
+                this.recentlyCompletedDriverGroups.clear();
+                newDriverGroupReady = SettableFuture.create();
+            }
+
+            for (Lifespan driverGroup : recentlyCompletedDriverGroups) {
+                IntListIterator driverGroupsIterator = nodeToDriverGroupsMap.get(driverGroupToNodeMap.get(driverGroup.getId()));
+                if (!driverGroupsIterator.hasNext()) {
+                    continue;
+                }
+                int driverGroupId = driverGroupsIterator.nextInt();
+                scheduler.startLifespan(Lifespan.driverGroup(driverGroupId), partitionHandles.get(driverGroupId));
+            }
+
+            return newDriverGroupReady;
+        }
+    }
+
+    private static class AsGroupedSourceScheduler
+            implements SourceScheduler
+    {
+        private final SourceScheduler sourceScheduler;
+        private boolean started;
+        private boolean completed;
+        private final List<Lifespan> pendingCompleted;
+
+        public AsGroupedSourceScheduler(SourceScheduler sourceScheduler)
+        {
+            this.sourceScheduler = requireNonNull(sourceScheduler, "sourceScheduler is null");
+            pendingCompleted = new ArrayList<>();
+        }
+
+        @Override
+        public ScheduleResult schedule()
+        {
+            return sourceScheduler.schedule();
+        }
+
+        @Override
+        public void close()
+        {
+            sourceScheduler.close();
+        }
+
+        @Override
+        public PlanNodeId getPlanNodeId()
+        {
+            return sourceScheduler.getPlanNodeId();
+        }
+
+        @Override
+        public void startLifespan(Lifespan lifespan, ConnectorPartitionHandle partitionHandle)
+        {
+            pendingCompleted.add(lifespan);
+            if (started) {
+                return;
+            }
+            started = true;
+            sourceScheduler.startLifespan(Lifespan.taskWide(), NOT_PARTITIONED);
+        }
+
+        @Override
+        public List<Lifespan> drainCompletedLifespans()
+        {
+            if (!completed) {
+                List<Lifespan> lifespans = sourceScheduler.drainCompletedLifespans();
+                if (lifespans.isEmpty()) {
+                    return ImmutableList.of();
+                }
+                checkState(ImmutableList.of(Lifespan.taskWide()).equals(lifespans));
+                completed = true;
+            }
+            List<Lifespan> result = ImmutableList.copyOf(pendingCompleted);
+            pendingCompleted.clear();
+            return result;
         }
     }
 }

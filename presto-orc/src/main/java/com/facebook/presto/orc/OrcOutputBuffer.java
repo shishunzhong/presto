@@ -30,8 +30,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.Charset;
 import java.util.Arrays;
+import java.util.List;
 
 import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Preconditions.checkState;
 import static io.airlift.slice.SizeOf.SIZE_OF_BYTE;
 import static io.airlift.slice.SizeOf.SIZE_OF_INT;
 import static io.airlift.slice.SizeOf.SIZE_OF_LONG;
@@ -101,9 +103,20 @@ public class OrcOutputBuffer
         }
     }
 
+    public long getOutputDataSize()
+    {
+        checkState(bufferPosition == 0, "Buffer must be flushed before getOutputDataSize can be called");
+        return compressedOutputStream.size();
+    }
+
+    public long estimateOutputDataSize()
+    {
+        return compressedOutputStream.size() + bufferPosition;
+    }
+
     public int writeDataTo(SliceOutput outputStream)
     {
-        flushBufferToOutputStream();
+        checkState(bufferPosition == 0, "Buffer must be closed before writeDataTo can be called");
         for (Slice slice : compressedOutputStream.getSlices()) {
             outputStream.writeBytes(slice);
         }
@@ -226,7 +239,7 @@ public class OrcOutputBuffer
         // Write huge chunks direct to OutputStream
         if (length >= DIRECT_FLUSH_SIZE) {
             flushBufferToOutputStream();
-            writeDirectlyToOutputStream((byte[]) source.getBase(), sourceIndex + (int) (slice.getAddress() - ARRAY_BYTE_BASE_OFFSET), length);
+            writeDirectlyToOutputStream((byte[]) source.getBase(), sourceIndex + (int) (source.getAddress() - ARRAY_BYTE_BASE_OFFSET), length);
             bufferOffset += length;
         }
         else {
@@ -350,6 +363,12 @@ public class OrcOutputBuffer
     public Slice getUnderlyingSlice()
     {
         throw new UnsupportedOperationException();
+    }
+
+    public List<Slice> getCompressedSlices()
+    {
+        flushBufferToOutputStream();
+        return compressedOutputStream.getSlices();
     }
 
     @Override

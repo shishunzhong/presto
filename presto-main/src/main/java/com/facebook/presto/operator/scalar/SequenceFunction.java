@@ -16,7 +16,6 @@ package com.facebook.presto.operator.scalar;
 import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.block.Block;
 import com.facebook.presto.spi.block.BlockBuilder;
-import com.facebook.presto.spi.block.BlockBuilderStatus;
 import com.facebook.presto.spi.function.Description;
 import com.facebook.presto.spi.function.ScalarFunction;
 import com.facebook.presto.spi.function.SqlType;
@@ -65,13 +64,12 @@ public final class SequenceFunction
     }
 
     @ScalarFunction("sequence")
-    @SqlType("array(timestamp)")
-    public static Block sequenceTimestampDayToSecond(
-            @SqlType(StandardTypes.TIMESTAMP) long start,
-            @SqlType(StandardTypes.TIMESTAMP) long stop,
-            @SqlType(StandardTypes.INTERVAL_DAY_TO_SECOND) long step)
+    @SqlType("array(date)")
+    public static Block sequenceDateDefaultStep(
+            @SqlType(StandardTypes.DATE) long start,
+            @SqlType(StandardTypes.DATE) long stop)
     {
-        return fixedWidthSequence(start, stop, step, TIMESTAMP);
+        return fixedWidthSequence(start, stop, stop >= start ? 1 : -1, DATE);
     }
 
     @ScalarFunction("sequence")
@@ -89,30 +87,6 @@ public final class SequenceFunction
     }
 
     @ScalarFunction("sequence")
-    @SqlType("array(timestamp)")
-    public static Block sequenceTimestampYearToMonth(
-            ConnectorSession session,
-            @SqlType(StandardTypes.TIMESTAMP) long start,
-            @SqlType(StandardTypes.TIMESTAMP) long stop,
-            @SqlType(StandardTypes.INTERVAL_YEAR_TO_MONTH) long step)
-    {
-        checkValidStep(start, stop, step);
-
-        int length = toIntExact(diffTimestamp(session, MONTH, start, stop) / step + 1);
-        checkMaxEntry(length);
-
-        BlockBuilder blockBuilder = BIGINT.createBlockBuilder(new BlockBuilderStatus(), length);
-
-        int value = 0;
-        for (int i = 0; i < length; ++i) {
-            BIGINT.writeLong(blockBuilder, DateTimeOperators.timestampPlusIntervalYearToMonth(session, start, value));
-            value += step;
-        }
-
-        return blockBuilder.build();
-    }
-
-    @ScalarFunction("sequence")
     @SqlType("array(date)")
     public static Block sequenceDateYearToMonth(
             ConnectorSession session,
@@ -125,11 +99,45 @@ public final class SequenceFunction
         int length = toIntExact(diffDate(session, MONTH, start, stop) / step + 1);
         checkMaxEntry(length);
 
-        BlockBuilder blockBuilder = DATE.createBlockBuilder(new BlockBuilderStatus(), length);
+        BlockBuilder blockBuilder = DATE.createBlockBuilder(null, length);
 
         int value = 0;
         for (int i = 0; i < length; ++i) {
             DATE.writeLong(blockBuilder, DateTimeOperators.datePlusIntervalYearToMonth(start, value));
+            value += step;
+        }
+
+        return blockBuilder.build();
+    }
+
+    @ScalarFunction("sequence")
+    @SqlType("array(timestamp)")
+    public static Block sequenceTimestampDayToSecond(
+            @SqlType(StandardTypes.TIMESTAMP) long start,
+            @SqlType(StandardTypes.TIMESTAMP) long stop,
+            @SqlType(StandardTypes.INTERVAL_DAY_TO_SECOND) long step)
+    {
+        return fixedWidthSequence(start, stop, step, TIMESTAMP);
+    }
+
+    @ScalarFunction("sequence")
+    @SqlType("array(timestamp)")
+    public static Block sequenceTimestampYearToMonth(
+            ConnectorSession session,
+            @SqlType(StandardTypes.TIMESTAMP) long start,
+            @SqlType(StandardTypes.TIMESTAMP) long stop,
+            @SqlType(StandardTypes.INTERVAL_YEAR_TO_MONTH) long step)
+    {
+        checkValidStep(start, stop, step);
+
+        int length = toIntExact(diffTimestamp(session, MONTH, start, stop) / step + 1);
+        checkMaxEntry(length);
+
+        BlockBuilder blockBuilder = BIGINT.createBlockBuilder(null, length);
+
+        int value = 0;
+        for (int i = 0; i < length; ++i) {
+            BIGINT.writeLong(blockBuilder, DateTimeOperators.timestampPlusIntervalYearToMonth(session, start, value));
             value += step;
         }
 
@@ -143,7 +151,7 @@ public final class SequenceFunction
         int length = toIntExact((stop - start) / step + 1L);
         checkMaxEntry(length);
 
-        BlockBuilder blockBuilder = type.createBlockBuilder(new BlockBuilderStatus(), length);
+        BlockBuilder blockBuilder = type.createBlockBuilder(null, length);
         for (long i = 0, value = start; i < length; ++i, value += step) {
             type.writeLong(blockBuilder, value);
         }

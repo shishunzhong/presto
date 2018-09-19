@@ -23,6 +23,7 @@ import com.google.common.collect.ImmutableList;
 import javax.inject.Inject;
 import javax.ws.rs.DELETE;
 import javax.ws.rs.GET;
+import javax.ws.rs.PUT;
 import javax.ws.rs.Path;
 import javax.ws.rs.PathParam;
 import javax.ws.rs.QueryParam;
@@ -33,6 +34,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.NoSuchElementException;
 
+import static com.facebook.presto.connector.system.KillQueryProcedure.createKillQueryException;
+import static com.facebook.presto.spi.StandardErrorCode.ADMINISTRATIVELY_KILLED;
 import static java.util.Objects.requireNonNull;
 
 /**
@@ -50,12 +53,13 @@ public class QueryResource
     }
 
     @GET
-    public List<BasicQueryInfo> getAllQueryInfo(@QueryParam("state") String queryState)
+    public List<BasicQueryInfo> getAllQueryInfo(@QueryParam("state") String stateFilter)
     {
+        QueryState expectedState = stateFilter == null ? null : QueryState.valueOf(stateFilter.toUpperCase(Locale.ENGLISH));
         ImmutableList.Builder<BasicQueryInfo> builder = new ImmutableList.Builder<>();
-        for (QueryInfo queryInfo : queryManager.getAllQueryInfo()) {
-            if (queryState == null || queryInfo.getState().equals(QueryState.valueOf(queryState.toUpperCase(Locale.ENGLISH)))) {
-                builder.add(new BasicQueryInfo(queryInfo));
+        for (BasicQueryInfo queryInfo : queryManager.getQueries()) {
+            if (stateFilter == null || queryInfo.getState() == expectedState) {
+                builder.add(queryInfo);
             }
         }
         return builder.build();
@@ -68,7 +72,7 @@ public class QueryResource
         requireNonNull(queryId, "queryId is null");
 
         try {
-            QueryInfo queryInfo = queryManager.getQueryInfo(queryId);
+            QueryInfo queryInfo = queryManager.getFullQueryInfo(queryId);
             return Response.ok(queryInfo).build();
         }
         catch (NoSuchElementException e) {
@@ -82,6 +86,34 @@ public class QueryResource
     {
         requireNonNull(queryId, "queryId is null");
         queryManager.cancelQuery(queryId);
+    }
+
+    @PUT
+    @Path("{queryId}/killed")
+    public Response killQuery(@PathParam("queryId") QueryId queryId, String message)
+    {
+        requireNonNull(queryId, "queryId is null");
+
+        try {
+            QueryState state = queryManager.getQueryState(queryId);
+
+            // check before killing to provide the proper error code (this is racy)
+            if (state.isDone()) {
+                return Response.status(Status.CONFLICT).build();
+            }
+
+            queryManager.failQuery(queryId, createKillQueryException(message));
+
+            // verify if the query was killed (if not, we lost the race)
+            if (!ADMINISTRATIVELY_KILLED.toErrorCode().equals(queryManager.getQueryInfo(queryId).getErrorCode())) {
+                return Response.status(Status.CONFLICT).build();
+            }
+
+            return Response.status(Status.OK).build();
+        }
+        catch (NoSuchElementException e) {
+            return Response.status(Status.GONE).build();
+        }
     }
 
     @DELETE

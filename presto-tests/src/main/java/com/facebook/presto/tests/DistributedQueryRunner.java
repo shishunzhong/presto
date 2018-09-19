@@ -23,6 +23,7 @@ import com.facebook.presto.metadata.Catalog;
 import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.metadata.QualifiedObjectName;
 import com.facebook.presto.metadata.SessionPropertyManager;
+import com.facebook.presto.server.BasicQueryInfo;
 import com.facebook.presto.server.testing.TestingPrestoServer;
 import com.facebook.presto.spi.Node;
 import com.facebook.presto.spi.Plugin;
@@ -184,7 +185,7 @@ public class DistributedQueryRunner
                 .put("distributed-index-joins-enabled", "true");
         if (coordinator) {
             propertiesBuilder.put("node-scheduler.include-coordinator", "true");
-            propertiesBuilder.put("distributed-joins-enabled", "true");
+            propertiesBuilder.put("join-distribution-type", "PARTITIONED");
         }
         HashMap<String, String> properties = new HashMap<>(propertiesBuilder.build());
         properties.putAll(extraProperties);
@@ -388,12 +389,12 @@ public class DistributedQueryRunner
 
     public QueryInfo getQueryInfo(QueryId queryId)
     {
-        return coordinator.getQueryManager().getQueryInfo(queryId);
+        return coordinator.getQueryManager().getFullQueryInfo(queryId);
     }
 
     public Plan getQueryPlan(QueryId queryId)
     {
-        return coordinator.getQueryManager().getQueryPlan(queryId);
+        return coordinator.getQueryPlan(queryId);
     }
 
     @Override
@@ -417,7 +418,7 @@ public class DistributedQueryRunner
     private void cancelAllQueries()
     {
         QueryManager queryManager = coordinator.getQueryManager();
-        for (QueryInfo queryInfo : queryManager.getAllQueryInfo()) {
+        for (BasicQueryInfo queryInfo : queryManager.getQueries()) {
             if (!queryInfo.getState().isDone()) {
                 queryManager.cancelQuery(queryInfo.getQueryId());
             }
